@@ -1,0 +1,2191 @@
+from datetime import date, datetime, timedelta
+import pandas as pd
+import streamlit as st
+import re
+
+# Import database module
+from db import (
+    init_db, get_or_create_user, get_or_create_course,
+    read_sql, execute, execute_returning, fetchone, fetchall,
+    is_postgres, get_conn,
+    get_course_total_marks, get_next_due_date, ensure_default_assessment, get_assessments,
+    # Auth functions
+    hash_password, verify_password, create_user, get_user_by_email, update_last_login,
+    # Session tracking
+    upsert_session, end_session, get_live_users_count,
+    # Legacy data functions
+    has_legacy_data, get_legacy_data_counts, claim_legacy_data,
+    # Admin functions
+    verify_admin, get_admin_stats, log_event,
+    # Database path (for diagnostics)
+    SQLITE_PATH, APP_DIR
+)
+import uuid
+
+# Import PDF extractor (optional)
+try:
+    from pdf_extractor import extract_and_process_topics, normalize_text, HAS_PYMUPDF
+except ImportError:
+    HAS_PYMUPDF = False
+
+def compute_mastery(topic_id: int, today: date, is_retake: bool = False) -> tuple:
+    """
+    Compute mastery (0-5) based on:
+    - Exercises: 50% weight (60% if retake)
+    - Study sessions: 35% weight (40% if retake)
+    - Lectures: 15% weight (0% if retake - no lectures for retakes)
+    - Timed attempts: boost exercise_score by up to 20% based on timed performance
+    """
+    exercises = fetchall("""
+        SELECT exercise_date, total_questions, correct_answers 
+        FROM exercises WHERE topic_id=? ORDER BY exercise_date DESC
+    """, (topic_id,))
+    
+    exercise_score = 0.0
+    exercise_count = len(exercises)
+    if exercises:
+        total_q = sum(e[1] for e in exercises)
+        total_correct = sum(e[2] for e in exercises)
+        if total_q > 0:
+            success_rate = total_correct / total_q
+            recent_exercises = [e for e in exercises if (today - pd.to_datetime(e[0]).date()).days <= 14]
+            recency_bonus = min(len(recent_exercises) * 0.2, 1.0)
+            exercise_score = success_rate * (0.7 + 0.3 * recency_bonus)
+    
+    # Boost exercise_score based on timed attempts that include this topic
+    topic_row = fetchone("SELECT course_id, topic_name FROM topics WHERE id=?", (topic_id,))
+    timed_boost = 0.0
+    timed_signal = 0.0  # Average score from timed attempts for this topic
+    timed_count = 0
+    
+    if topic_row:
+        course_id_topic, topic_name = topic_row
+        timed_attempts = fetchall("""
+            SELECT attempt_date, score_pct, topics 
+            FROM timed_attempts WHERE course_id=? ORDER BY attempt_date DESC
+        """, (course_id_topic,))
+        
+        topic_timed_scores = []
+        for ta in timed_attempts:
+            topics_in_attempt = ta[2] or ""
+            if topic_name.lower() in topics_in_attempt.lower():
+                score_pct = float(ta[1])
+                days_ago = (today - pd.to_datetime(ta[0]).date()).days
+                # Apply decay: recent attempts matter more
+                decay = 1.0 if days_ago <= 7 else (0.9 if days_ago <= 14 else (0.7 if days_ago <= 30 else 0.5))
+                topic_timed_scores.append(score_pct * decay)
+                timed_count += 1
+        
+        if topic_timed_scores:
+            avg_timed_score = sum(topic_timed_scores) / len(topic_timed_scores)
+            timed_signal = avg_timed_score  # Store for later blending
+            # Boost up to +20% of exercise_score based on timed performance
+            timed_boost = min(avg_timed_score * 0.2, 0.2)
+            exercise_score = min(exercise_score + timed_boost, 1.0)
+    
+    sessions = fetchall("""
+        SELECT session_date, duration_mins, quality 
+        FROM study_sessions WHERE topic_id=? ORDER BY session_date DESC
+    """, (topic_id,))
+    
+    study_score = 0.0
+    study_count = len(sessions)
+    if sessions:
+        weighted_sessions = 0.0
+        for s in sessions:
+            days_ago = (today - pd.to_datetime(s[0]).date()).days
+            quality = s[2] / 5.0
+            duration_factor = min(s[1] / 60.0, 1.5)
+            decay = 1.0 if days_ago <= 7 else (0.8 if days_ago <= 14 else (0.6 if days_ago <= 30 else 0.4))
+            weighted_sessions += quality * duration_factor * decay
+        study_score = min(weighted_sessions / 3.0, 1.0)
+    
+    lecture_score = 0.0
+    lecture_count = 0
+    
+    # Only count lectures if not a retake
+    if not is_retake:
+        if topic_row:
+            lectures = fetchall("""
+                SELECT lecture_date, attended, topics_planned 
+                FROM scheduled_lectures WHERE course_id=? AND attended=1
+            """, (course_id_topic,))
+            
+            for lec in lectures:
+                topics_covered = lec[2] or ""
+                if topic_name.lower() in topics_covered.lower():
+                    lecture_count += 1
+            lecture_score = min(lecture_count * 0.4, 1.0)
+    
+    # Adjust weights based on retake status
+    if is_retake:
+        mastery = (exercise_score * 3.0) + (study_score * 2.0)
+    else:
+        mastery = (exercise_score * 2.5) + (study_score * 1.75) + (lecture_score * 0.75)
+    
+    mastery = min(mastery, 5.0)
+    
+    all_dates = []
+    for e in exercises:
+        all_dates.append(pd.to_datetime(e[0]).date())
+    for s in sessions:
+        all_dates.append(pd.to_datetime(s[0]).date())
+    last_activity = max(all_dates) if all_dates else None
+    
+    return mastery, last_activity, exercise_count, study_count, lecture_count, timed_signal, timed_count
+
+def decay_factor(days_since: int) -> float:
+    if days_since <= 7:
+        return 1.0
+    if days_since <= 14:
+        return 0.85
+    if days_since <= 30:
+        return 0.70
+    return 0.55
+
+def compute_readiness(topics_with_mastery: pd.DataFrame, today: date):
+    df = topics_with_mastery.copy()
+    
+    readiness_vals = []
+    for _, r in df.iterrows():
+        m = float(r["mastery"]) if pd.notna(r["mastery"]) else 0
+        lr = r["last_activity"]
+        if pd.isna(lr) or lr is None:
+            dec = 0.6 if m > 0 else 0.0
+        else:
+            if isinstance(lr, str):
+                lr_date = pd.to_datetime(lr).date()
+            else:
+                lr_date = lr
+            days_since = (today - lr_date).days
+            dec = decay_factor(days_since)
+        readiness_vals.append((m / 5.0) * dec)
+
+    df["readiness"] = readiness_vals
+    df["expected_points"] = df["weight_points"] * df["readiness"]
+
+    total_weight = float(df["weight_points"].sum()) if not df.empty else 0.0
+    total_expected = float(df["expected_points"].sum()) if not df.empty else 0.0
+
+    coverage_pct = (df.loc[df["mastery"] >= 1, "weight_points"].sum() / total_weight) if total_weight > 0 else 0.0
+    mastery_pct = (float((df["weight_points"] * (df["mastery"] / 5.0)).sum()) / total_weight) if total_weight > 0 else 0.0
+    retention_pct = (float((df["weight_points"] * df["readiness"]).sum()) / total_weight) if total_weight > 0 else 0.0
+
+    return df, total_expected, total_weight, coverage_pct, mastery_pct, retention_pct
+
+def generate_recommendations(topics_scored: pd.DataFrame, upcoming_lectures: pd.DataFrame, days_left: int, today: date, is_retake: bool = False) -> list:
+    """Generate smart study recommendations based on gaps, lectures, and exam proximity."""
+    recommendations = []
+    
+    if topics_scored.empty:
+        return ["Add topics to get personalized recommendations."]
+    
+    gaps = topics_scored.sort_values("gap_score", ascending=False)
+    
+    if not is_retake and not upcoming_lectures.empty:
+        for _, lec in upcoming_lectures.iterrows():
+            lec_date = pd.to_datetime(lec["lecture_date"]).date()
+            days_until = (lec_date - today).days
+            if 0 <= days_until <= 3:
+                topics_planned = lec["topics_planned"] or ""
+                for topic in topics_planned.split(","):
+                    topic = topic.strip()
+                    if topic:
+                        match = topics_scored[topics_scored["topic_name"].str.lower().str.contains(topic.lower(), na=False)]
+                        if not match.empty:
+                            mastery = match.iloc[0]["mastery"]
+                            if mastery < 2:
+                                recommendations.append(f"🔴 **URGENT**: Review **{topic}** before lecture on {lec_date.strftime('%a %d/%m')}")
+                            elif mastery < 4:
+                                recommendations.append(f"🟡 **Prep**: Brush up on **{topic}** before lecture on {lec_date.strftime('%a %d/%m')}")
+    
+    if days_left <= 7:
+        priority = "🚨 EXAM WEEK"
+        top_gaps = gaps.head(3)
+        for _, g in top_gaps.iterrows():
+            if g["readiness"] < 0.6:
+                recommendations.append(f"{priority}: Focus on **{g['topic_name']}** (weight: {g['weight_points']}, readiness: {g['readiness']*100:.0f}%)")
+    elif days_left <= 14:
+        top_gaps = gaps.head(4)
+        for _, g in top_gaps.iterrows():
+            if g["readiness"] < 0.7:
+                recommendations.append(f"⚠️ **2 weeks left**: Prioritize **{g['topic_name']}** (gap score: {g['gap_score']:.1f})")
+    elif days_left <= 30:
+        top_gaps = gaps.head(5)
+        for _, g in top_gaps.iterrows():
+            if g["mastery"] < 3:
+                recommendations.append(f"📚 Study **{g['topic_name']}** - mastery only {g['mastery']:.1f}/5")
+    
+    stale_topics = topics_scored[
+        (topics_scored["mastery"] >= 2) & 
+        (topics_scored["readiness"] < topics_scored["mastery"] / 5.0 * 0.7)
+    ].head(3)
+    for _, t in stale_topics.iterrows():
+        recommendations.append(f"🔄 **Refresh**: {t['topic_name']} - mastery decaying (last activity: {t['last_activity'] or 'never'})")
+    
+    untouched = topics_scored[topics_scored["mastery"] == 0].sort_values("weight_points", ascending=False).head(2)
+    for _, t in untouched.iterrows():
+        if t["weight_points"] > 0:
+            recommendations.append(f"🆕 **Start**: {t['topic_name']} (worth {t['weight_points']} points, not yet studied)")
+    
+    if not recommendations:
+        avg_readiness = topics_scored["readiness"].mean()
+        if avg_readiness >= 0.8:
+            recommendations.append("✅ **Great progress!** Focus on practice exams and timed exercises.")
+        elif avg_readiness >= 0.6:
+            recommendations.append("📈 **Good progress!** Keep up the consistent study sessions.")
+        else:
+            recommendations.append("📚 **More work needed.** Prioritize high-weight topics first.")
+    
+    return recommendations[:8]
+
+# ============ STREAMLIT APP ============
+
+st.set_page_config(page_title="Exam Readiness Predictor", page_icon="📈", layout="wide")
+init_db()
+
+# Show database mode indicator
+db_mode = "🐘 Postgres (Supabase)" if is_postgres() else "📁 SQLite (Local)"
+
+# ============ DATABASE DIAGNOSTICS ============
+# Display database path and status for debugging persistence issues
+if not is_postgres():
+    from pathlib import Path
+    db_path = Path(SQLITE_PATH)
+    db_exists = db_path.exists()
+
+    with st.sidebar:
+        with st.expander("🔍 Database Diagnostics", expanded=False):
+            st.caption("**Database Path:**")
+            st.code(str(SQLITE_PATH), language=None)
+            st.caption(f"**File Exists:** {'✅ Yes' if db_exists else '❌ No'}")
+            if db_exists:
+                db_size = db_path.stat().st_size
+                st.caption(f"**File Size:** {db_size:,} bytes")
+            st.caption(f"**App Directory:** {str(APP_DIR)}")
+
+# ============ SESSION STATE INITIALIZATION ============
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+    st.session_state.user_email = None
+    st.session_state.is_admin = False
+
+# Session ID for tracking (generated once per browser session)
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+# Wizard state
+if "wizard_step" not in st.session_state:
+    st.session_state.wizard_step = 0
+if "wizard_data" not in st.session_state:
+    st.session_state.wizard_data = {}
+
+# Study plan defaults
+if "hours_per_week" not in st.session_state:
+    st.session_state.hours_per_week = 10
+if "session_length" not in st.session_state:
+    st.session_state.session_length = 60
+
+# ============ AUTHENTICATION GATE ============
+def show_auth_page():
+    """Show login/signup page. Returns True if user is authenticated."""
+    st.title("📈 Exam Readiness Predictor")
+    st.caption("Track your study progress and predict your exam grades.")
+    
+    login_tab, signup_tab, admin_tab = st.tabs(["🔐 Login", "📝 Sign Up", "👑 Admin"])
+    
+    # Login tab
+    with login_tab:
+        st.subheader("Login to Your Account")
+        with st.form("login_form"):
+            login_email = st.text_input("Email", placeholder="you@example.com", key="login_email_input")
+            login_password = st.text_input("Password", type="password", key="login_password_input")
+            
+            submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
+            
+            if submitted:
+                if not login_email or not login_password:
+                    st.error("Please enter email and password.")
+                else:
+                    user = get_user_by_email(login_email)
+                    if user is None:
+                        st.error("Email not found. Please sign up first.")
+                    elif not user["password_hash"]:
+                        st.error("This account has no password set. Please contact support.")
+                    elif not verify_password(login_password, user["password_hash"]):
+                        st.error("Incorrect password.")
+                    else:
+                        # Successful login
+                        st.session_state.user_id = user["id"]
+                        st.session_state.user_email = user["email"]
+                        update_last_login(user["id"])
+                        st.session_state.wizard_step = 0
+                        st.session_state.wizard_data = {}
+                        st.success("Login successful!")
+                        st.rerun()
+    
+    # Signup tab
+    with signup_tab:
+        st.subheader("Create New Account")
+        with st.form("signup_form"):
+            signup_email = st.text_input("Email *", placeholder="you@example.com", key="signup_email_input")
+            signup_username = st.text_input("Username (optional)", placeholder="johndoe", key="signup_username_input")
+            signup_password = st.text_input("Password *", type="password", help="Minimum 8 characters", key="signup_password_input")
+            signup_password_confirm = st.text_input("Confirm Password *", type="password", key="signup_password_confirm_input")
+            
+            submitted = st.form_submit_button("Create Account", type="primary", use_container_width=True)
+            
+            if submitted:
+                errors = []
+                
+                # Email validation
+                if not signup_email:
+                    errors.append("Email is required.")
+                elif not re.match(r"[^@]+@[^@]+\.[^@]+", signup_email):
+                    errors.append("Invalid email format.")
+                
+                # Password validation
+                if not signup_password:
+                    errors.append("Password is required.")
+                elif len(signup_password) < 8:
+                    errors.append("Password must be at least 8 characters.")
+                
+                if signup_password != signup_password_confirm:
+                    errors.append("Passwords do not match.")
+                
+                if errors:
+                    for e in errors:
+                        st.error(e)
+                else:
+                    try:
+                        user_id = create_user(
+                            signup_email, 
+                            signup_username if signup_username else None, 
+                            signup_password
+                        )
+                        st.session_state.user_id = user_id
+                        st.session_state.user_email = signup_email.lower().strip()
+                        update_last_login(user_id)
+                        st.session_state.wizard_step = 0
+                        st.success("Account created! Welcome!")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+    
+    # Admin tab
+    with admin_tab:
+        st.subheader("Admin Login")
+        st.caption("For system administrators only.")
+        with st.form("admin_form"):
+            admin_username = st.text_input("Admin Username", key="admin_username_input")
+            admin_password = st.text_input("Admin Password", type="password", key="admin_password_input")
+            
+            submitted = st.form_submit_button("Admin Login", type="primary", use_container_width=True)
+            
+            if submitted:
+                if not admin_username or not admin_password:
+                    st.error("Please enter admin credentials.")
+                elif verify_admin(admin_username, admin_password):
+                    st.session_state.user_id = -1  # Special admin ID
+                    st.session_state.user_email = admin_username
+                    st.session_state.is_admin = True
+                    log_event(None, "admin_login", f'{{"username": "{admin_username}"}}')
+                    st.success("Admin login successful!")
+                    st.rerun()
+                else:
+                    st.error("Invalid admin credentials.")
+    
+    st.divider()
+    st.caption(f"Database: {db_mode}")
+
+# Check if user is logged in - show auth page if not
+if st.session_state.user_id is None:
+    show_auth_page()
+    st.stop()
+
+# ============ ADMIN DASHBOARD ============
+if st.session_state.is_admin:
+    st.title("👑 Admin Dashboard")
+    st.caption("System usage metrics and analytics.")
+    
+    # Logout button
+    if st.button("🚪 Logout"):
+        st.session_state.user_id = None
+        st.session_state.user_email = None
+        st.session_state.is_admin = False
+        st.session_state.session_id = str(uuid.uuid4())
+        log_event(None, "admin_logout")
+        st.rerun()
+    
+    st.divider()
+    
+    # Get admin stats
+    stats = get_admin_stats()
+    
+    # Live users section
+    st.subheader("🟢 Live Users")
+    st.metric("Active Now (last 10 min)", stats["live_users"])
+    
+    st.divider()
+    
+    # User signups section
+    st.subheader("👥 User Signups")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Users", stats["total_users"])
+    col2.metric("Last Day", stats["users_day"])
+    col3.metric("Last Week", stats["users_week"])
+    col4.metric("Last Month", stats["users_month"])
+    
+    st.divider()
+    
+    # Course creation section
+    st.subheader("📚 Course Creation Activity")
+    st.caption("Unique users who created a course:")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Last Day", stats["course_creators_day"])
+    col2.metric("Last Week", stats["course_creators_week"])
+    col3.metric("Last Month", stats["course_creators_month"])
+    
+    st.metric("Total Courses Created (all time)", stats["total_courses_created"])
+    
+    st.divider()
+    st.caption(f"Database: {db_mode}")
+    st.stop()
+
+# ============ LEGACY DATA CLAIM ============
+# Check for legacy data (rows with NULL user_id) on first login
+if "legacy_checked" not in st.session_state:
+    st.session_state.legacy_checked = False
+
+if not st.session_state.legacy_checked and has_legacy_data():
+    st.warning("📦 **Legacy Data Found**")
+    st.info("We found data from before user accounts were introduced. Click below to claim this data to your account.")
+    
+    counts = get_legacy_data_counts()
+    count_str = ", ".join([f"{v} {k}" for k, v in counts.items() if v > 0])
+    st.caption(f"Found: {count_str}")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("✅ Claim Legacy Data", type="primary"):
+            claimed = claim_legacy_data(st.session_state.user_id)
+            st.session_state.legacy_checked = True
+            st.success(f"Data claimed! You now own this data.")
+            st.rerun()
+    with col2:
+        if st.button("⏭️ Skip"):
+            st.session_state.legacy_checked = True
+            st.rerun()
+    st.stop()
+else:
+    st.session_state.legacy_checked = True
+
+# ============ SESSION TRACKING ============
+# Update session on every page load for logged-in users
+if st.session_state.user_id is not None:
+    upsert_session(st.session_state.user_id, st.session_state.session_id)
+
+# ============ ONBOARDING WIZARD ============
+def show_onboarding_wizard(user_id: int):
+    """Show 3-step onboarding wizard for first-time users."""
+    
+    st.title("🎓 Welcome to Exam Readiness Predictor!")
+    st.caption("Let's set up your first course in under 2 minutes.")
+    
+    # Progress indicator
+    steps = ["📚 Course", "📅 Exam", "📖 Topics"]
+    cols = st.columns(3)
+    for i, (col, step) in enumerate(zip(cols, steps)):
+        if i < st.session_state.wizard_step:
+            col.success(f"✅ {step}")
+        elif i == st.session_state.wizard_step:
+            col.info(f"👉 {step}")
+        else:
+            col.write(f"⏳ {step}")
+    
+    st.divider()
+    
+    # Step 1: Create Course
+    if st.session_state.wizard_step == 0:
+        st.header("Step 1: Create Your Course")
+        st.write("What course are you preparing for?")
+        
+        with st.form("wizard_course"):
+            course_name = st.text_input("Course name *", placeholder="e.g., Microeconomics, Data Structures, Organic Chemistry")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                total_marks = st.number_input("Total exam marks", min_value=1, value=120, help="Maximum marks for the exam")
+            with col2:
+                target_marks = st.number_input("Your target marks", min_value=0, value=90, help="What score are you aiming for?")
+            
+            submitted = st.form_submit_button("Next →", type="primary", use_container_width=True)
+            
+            if submitted:
+                if course_name.strip():
+                    # Create the course
+                    course_id = get_or_create_course(user_id, course_name.strip())
+                    execute("UPDATE courses SET total_marks=?, target_marks=? WHERE id=?", 
+                           (total_marks, target_marks, course_id))
+                    
+                    st.session_state.wizard_data["course_id"] = course_id
+                    st.session_state.wizard_data["course_name"] = course_name.strip()
+                    st.session_state.wizard_data["total_marks"] = total_marks
+                    st.session_state.wizard_step = 1
+                    st.rerun()
+                else:
+                    st.error("Please enter a course name.")
+    
+    # Step 2: Add Exam
+    elif st.session_state.wizard_step == 1:
+        st.header("Step 2: Add Your Exam")
+        st.write(f"When is the exam for **{st.session_state.wizard_data['course_name']}**?")
+        
+        with st.form("wizard_exam"):
+            exam_name = st.text_input("Exam name *", value="Final Exam", placeholder="e.g., Midterm, Final Exam")
+            exam_date = st.date_input("Exam date *", value=date.today() + timedelta(days=60))
+            is_retake = st.checkbox("🔄 This is a retake (no lectures)", value=False,
+                                   help="Check if you're retaking the exam and won't attend lectures")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                back = st.form_submit_button("← Back", use_container_width=True)
+            with col2:
+                submitted = st.form_submit_button("Next →", type="primary", use_container_width=True)
+            
+            if back:
+                st.session_state.wizard_step = 0
+                st.rerun()
+            
+            if submitted:
+                if exam_name.strip():
+                    course_id = st.session_state.wizard_data["course_id"]
+                    execute_returning(
+                        "INSERT INTO exams(user_id, course_id, exam_name, exam_date, is_retake) VALUES(?,?,?,?,?)",
+                        (user_id, course_id, exam_name.strip(), str(exam_date), 1 if is_retake else 0)
+                    )
+                    
+                    st.session_state.wizard_data["exam_name"] = exam_name.strip()
+                    st.session_state.wizard_data["exam_date"] = exam_date
+                    st.session_state.wizard_step = 2
+                    st.rerun()
+                else:
+                    st.error("Please enter an exam name.")
+    
+    # Step 3: Add Topics
+    elif st.session_state.wizard_step == 2:
+        st.header("Step 3: Add Your Topics")
+        st.write("What topics will be covered in the exam? Add one per line.")
+        st.caption("💡 Tip: You can include weights like `Topic Name, 20` or just `Topic Name` (default weight: 10)")
+        
+        # Example topics
+        example_topics = """Supply and Demand, 15
+Market Equilibrium, 20
+Elasticity, 15
+Consumer Theory, 25
+Producer Theory, 25"""
+        
+        with st.form("wizard_topics"):
+            topics_text = st.text_area(
+                "Topics (one per line) *",
+                value="",
+                placeholder=example_topics,
+                height=200,
+                help="Format: 'Topic Name' or 'Topic Name, weight'"
+            )
+            
+            st.caption("Example format:")
+            st.code(example_topics, language=None)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                back = st.form_submit_button("← Back", use_container_width=True)
+            with col2:
+                submitted = st.form_submit_button("🎉 Complete Setup", type="primary", use_container_width=True)
+            
+            if back:
+                st.session_state.wizard_step = 1
+                st.rerun()
+            
+            if submitted:
+                if topics_text.strip():
+                    course_id = st.session_state.wizard_data["course_id"]
+                    lines = topics_text.strip().split("\n")
+                    topics_added = 0
+                    
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        # Parse "Topic Name, weight" or just "Topic Name"
+                        if "," in line:
+                            parts = line.rsplit(",", 1)
+                            topic_name = parts[0].strip()
+                            try:
+                                weight = float(parts[1].strip())
+                            except ValueError:
+                                weight = 10
+                        else:
+                            topic_name = line
+                            weight = 10
+                        
+                        if topic_name:
+                            execute_returning(
+                                "INSERT INTO topics(user_id, course_id, topic_name, weight_points) VALUES(?,?,?,?)",
+                                (user_id, course_id, topic_name, weight)
+                            )
+                            topics_added += 1
+                    
+                    if topics_added > 0:
+                        # Complete wizard - set the newly created course as selected
+                        course_name = st.session_state.wizard_data.get("course_name", "")
+                        st.session_state.selected_course_name = course_name
+                        st.session_state.wizard_step = -1  # Mark as completed
+                        st.session_state.wizard_data = {}
+                        st.balloons()
+                        st.success(f"🎉 Setup complete! Added {topics_added} topics.")
+                        st.rerun()
+                    else:
+                        st.error("Please add at least one topic.")
+                else:
+                    st.error("Please add at least one topic.")
+    
+    st.stop()
+
+# ============ SIDEBAR ============
+with st.sidebar:
+    # User info and logout
+    st.header("👤 Account")
+    st.success(f"**{st.session_state.user_email}**")
+    if st.button("🚪 Logout"):
+        # End session tracking
+        if st.session_state.user_id and st.session_state.session_id:
+            end_session(st.session_state.user_id, st.session_state.session_id)
+        st.session_state.user_id = None
+        st.session_state.user_email = None
+        st.session_state.wizard_step = 0
+        st.session_state.wizard_data = {}
+        st.session_state.legacy_checked = False
+        # Generate new session_id for next login
+        st.session_state.session_id = str(uuid.uuid4())
+        st.rerun()
+    st.caption(f"Database: {db_mode}")
+    st.divider()
+    
+    # Get current user_id
+    user_id = st.session_state.user_id
+    
+    # Check if user needs onboarding (no courses yet)
+    courses = read_sql("SELECT * FROM courses WHERE user_id=?", (user_id,))
+    
+    if courses.empty and st.session_state.wizard_step >= 0:
+        # Show wizard in main area (not sidebar)
+        pass  # Will be handled after sidebar
+    
+    # Course setup (only show if user has courses)
+    if not courses.empty:
+        st.header("📚 Course Setup")
+        
+        course_options = courses["course_name"].tolist()
+        
+        new_course = st.text_input("Add new course", placeholder="e.g., Microeconomics")
+        if st.button("➕ Add Course") and new_course.strip():
+            get_or_create_course(user_id, new_course.strip())
+            st.rerun()
+
+    course_options = courses["course_name"].tolist() if not courses.empty else []
+    
+    if course_options:
+        # Initialize session state for selected course if needed
+        if "selected_course_name" not in st.session_state or st.session_state.selected_course_name not in course_options:
+            st.session_state.selected_course_name = course_options[0]
+        
+        selected_course = st.selectbox(
+            "Select course", 
+            course_options,
+            index=course_options.index(st.session_state.selected_course_name),
+            key="course_selector"
+        )
+        st.session_state.selected_course_name = selected_course
+        
+        course_id = int(courses.loc[courses["course_name"] == selected_course, "id"].iloc[0])
+        course_row = courses[courses["course_name"] == selected_course].iloc[0]
+        
+        # Ensure at least one assessment exists (backward compatibility)
+        ensure_default_assessment(user_id, course_id)
+        
+        # Get computed total marks from assessments
+        course_total_marks = get_course_total_marks(user_id, course_id)
+        if course_total_marks == 0:
+            st.warning("⚠️ No assessments found. Go to Assessments tab to add one.")
+            if st.button("📝 Create Default Assessment (120 marks)"):
+                execute_returning(
+                    """INSERT INTO assessments(user_id, course_id, assessment_name, assessment_type, marks, is_timed)
+                       VALUES(?,?,?,?,?,?)""",
+                    (user_id, course_id, "Final Exam", "Exam", 120, 1)
+                )
+                st.rerun()
+            course_total_marks = 120  # Fallback for display
+        
+        st.metric("📊 Total Marks", f"{course_total_marks}", help="Sum of all assessment marks")
+        
+        # Target settings with toggle
+        target_mode = st.radio("Target mode", ["Marks", "Percentage"], horizontal=True, key="target_mode")
+        stored_target = int(course_row["target_marks"]) if course_row["target_marks"] else 90
+        
+        if target_mode == "Marks":
+            target_marks = st.number_input("Target marks", min_value=0, max_value=course_total_marks, value=min(stored_target, course_total_marks))
+            target_pct = (target_marks / course_total_marks * 100) if course_total_marks > 0 else 0
+            st.caption(f"≈ {target_pct:.0f}%")
+        else:
+            target_pct = st.slider("Target %", min_value=0, max_value=100, value=int(stored_target / course_total_marks * 100) if course_total_marks > 0 else 75)
+            target_marks = int(course_total_marks * target_pct / 100)
+            st.caption(f"= {target_marks} marks")
+        
+        if st.button("💾 Save Target"):
+            execute("UPDATE courses SET target_marks=? WHERE id=? AND user_id=?", 
+                   (target_marks, course_id, user_id))
+            st.success("Target saved!")
+        
+        # Study plan settings
+        st.divider()
+        st.header("📅 Study Plan Settings")
+        hours_per_week = st.slider("Hours per week", min_value=1, max_value=40, value=10, 
+                                   help="How many hours can you dedicate to studying this course per week?")
+        session_length = st.selectbox("Preferred session length", 
+                                      options=[30, 45, 60, 90, 120],
+                                      index=2,
+                                      format_func=lambda x: f"{x} mins",
+                                      help="Your ideal study session duration")
+        
+        # Store in session state for dashboard access
+        st.session_state.hours_per_week = hours_per_week
+        st.session_state.session_length = session_length
+        
+        # Delete course section
+        st.divider()
+        with st.expander("🗑️ Delete Course", expanded=False):
+            st.warning(f"⚠️ This will permanently delete **{selected_course}** and all its data.")
+            confirm_delete = st.text_input("Type the course name to confirm deletion:", key="confirm_delete_course")
+            if st.button("🗑️ Delete Course Permanently", type="primary"):
+                if confirm_delete == selected_course:
+                    # Get all topic IDs for this course to delete related data
+                    topic_ids = fetchall("SELECT id FROM topics WHERE user_id=? AND course_id=?", (user_id, course_id))
+                    with get_conn() as conn:
+                        cur = conn.cursor()
+                        for (tid,) in topic_ids:
+                            if is_postgres():
+                                cur.execute("DELETE FROM study_sessions WHERE topic_id=%s", (tid,))
+                                cur.execute("DELETE FROM exercises WHERE topic_id=%s", (tid,))
+                            else:
+                                cur.execute("DELETE FROM study_sessions WHERE topic_id=?", (tid,))
+                                cur.execute("DELETE FROM exercises WHERE topic_id=?", (tid,))
+                        if is_postgres():
+                            cur.execute("DELETE FROM topics WHERE user_id=%s AND course_id=%s", (user_id, course_id))
+                            cur.execute("DELETE FROM scheduled_lectures WHERE user_id=%s AND course_id=%s", (user_id, course_id))
+                            cur.execute("DELETE FROM exams WHERE user_id=%s AND course_id=%s", (user_id, course_id))
+                            cur.execute("DELETE FROM courses WHERE id=%s AND user_id=%s", (course_id, user_id))
+                        else:
+                            cur.execute("DELETE FROM topics WHERE user_id=? AND course_id=?", (user_id, course_id))
+                            cur.execute("DELETE FROM scheduled_lectures WHERE user_id=? AND course_id=?", (user_id, course_id))
+                            cur.execute("DELETE FROM exams WHERE user_id=? AND course_id=?", (user_id, course_id))
+                            cur.execute("DELETE FROM courses WHERE id=? AND user_id=?", (course_id, user_id))
+                        conn.commit()
+                    st.success("Course deleted!")
+                    st.rerun()
+                else:
+                    st.error("Course name doesn't match. Deletion cancelled.")
+    else:
+        # No courses - wizard will handle this
+        pass
+
+# ============ CHECK FOR ONBOARDING ============
+# Re-check courses after sidebar (in case we need wizard)
+user_id = st.session_state.user_id
+courses = read_sql("SELECT * FROM courses WHERE user_id=?", (user_id,))
+
+if courses.empty and st.session_state.wizard_step >= 0:
+    # First-time user - show onboarding wizard
+    show_onboarding_wizard(user_id)
+
+# If still no courses after wizard check, stop
+if courses.empty:
+    st.warning("Please complete the setup wizard to continue.")
+    st.stop()
+
+# At this point, we have courses - get the selected course from session state
+# (These variables were already set in sidebar, but we need them in main scope)
+course_options = courses["course_name"].tolist()
+selected_course = st.session_state.get("selected_course_name", course_options[0])
+if selected_course not in course_options:
+    selected_course = course_options[0]
+    st.session_state.selected_course_name = selected_course
+
+course_id = int(courses.loc[courses["course_name"] == selected_course, "id"].iloc[0])
+course_row = courses[courses["course_name"] == selected_course].iloc[0]
+
+# Get computed total marks from assessments (not from course table)
+ensure_default_assessment(user_id, course_id)
+total_marks = get_course_total_marks(user_id, course_id)
+if total_marks == 0:
+    total_marks = 120  # Fallback
+target_marks = int(course_row["target_marks"]) if course_row["target_marks"] else int(total_marks * 0.75)
+
+st.title("📈 Exam Readiness Predictor")
+st.caption("Auto-calculated mastery from study sessions, exercises, and lectures.")
+
+# ============ TABS ============
+tabs = st.tabs(["📊 Dashboard", "📋 Assessments", "📅 Exams", "📖 Topics", "📥 Import Topics", "✏️ Study Sessions", "🏋️ Exercises", "⏱️ Timed Attempts", "🎓 Lecture Calendar", "📤 Export"])
+
+# ============ DASHBOARD ============
+with tabs[0]:
+    today = date.today()
+    
+    # Get course total marks from assessments
+    course_total_marks = get_course_total_marks(user_id, course_id)
+    if course_total_marks == 0:
+        ensure_default_assessment(user_id, course_id)
+        course_total_marks = get_course_total_marks(user_id, course_id)
+    
+    # Get next due date from assessments (primary source)
+    next_due, next_assessment_name, next_is_timed = get_next_due_date(user_id, course_id, today)
+    
+    # Fallback to exams table for backward compatibility
+    exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date", 
+                        (user_id, course_id))
+    
+    # Determine tracking date and retake status
+    if next_due:
+        # Use assessment due date
+        tracking_date = next_due
+        days_left = max((tracking_date - today).days, 0)
+        is_retake = not next_is_timed  # Non-timed assessments treated like retakes (no lecture requirement)
+        st.caption(f"📅 Tracking: **{next_assessment_name}** (due {tracking_date.strftime('%d/%m/%Y')})")
+    elif not exams_df.empty:
+        # Fallback to exam date
+        exam_options = exams_df.apply(lambda r: f"{r['exam_name']} ({r['exam_date']}){' 🔄 RETAKE' if r.get('is_retake', 0) == 1 else ''}", axis=1).tolist()
+        selected_exam_idx = st.selectbox("Select exam to track", range(len(exam_options)), format_func=lambda i: exam_options[i])
+        exam_row = exams_df.iloc[selected_exam_idx]
+        tracking_date = pd.to_datetime(exam_row["exam_date"]).date()
+        days_left = max((tracking_date - today).days, 0)
+        is_retake = bool(exam_row.get("is_retake", 0))
+    else:
+        st.warning("⚠️ No assessments with due dates. Go to Assessments tab to add one.")
+        tracking_date = None
+        days_left = 30  # Default for calculations
+        is_retake = False
+    
+    if is_retake:
+        st.info("🔄 **Non-timed assessment** — Lectures not included in readiness calculations.")
+    
+    topics_df = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id", 
+                         (user_id, course_id))
+    upcoming_lectures = read_sql("""
+        SELECT * FROM scheduled_lectures 
+        WHERE user_id=? AND course_id=? AND lecture_date >= ? 
+        ORDER BY lecture_date LIMIT 10
+    """, (user_id, course_id, str(today)))
+    
+    # Get timed attempts data for dashboard display
+    timed_attempts_df = read_sql("""
+        SELECT * FROM timed_attempts 
+        WHERE user_id=? AND course_id=? 
+        ORDER BY attempt_date DESC
+    """, (user_id, course_id))
+    
+    # Timed attempts stats
+    recent_timed = timed_attempts_df[
+        pd.to_datetime(timed_attempts_df["attempt_date"]).dt.date >= (today - timedelta(days=14))
+    ] if not timed_attempts_df.empty else pd.DataFrame()
+    latest_timed_score = timed_attempts_df.iloc[0]["score_pct"] * 100 if not timed_attempts_df.empty else None
+    timed_count_14d = len(recent_timed)
+    
+    if topics_df.empty:
+        st.info("📖 No topics added yet. Go to Topics tab to add some.")
+    else:
+        mastery_data = []
+        for _, row in topics_df.iterrows():
+            m, last_act, ex_cnt, st_cnt, lec_cnt, timed_sig, timed_cnt = compute_mastery(int(row["id"]), today, is_retake)
+            mastery_data.append({
+                "id": row["id"],
+                "topic_name": row["topic_name"],
+                "weight_points": row["weight_points"],
+                "mastery": round(m, 2),
+                "last_activity": last_act,
+                "exercises": ex_cnt,
+                "study_sessions": st_cnt,
+                "lectures": lec_cnt if not is_retake else 0,
+                "timed_signal": timed_sig,
+                "timed_count": timed_cnt
+            })
+        
+        topics_with_mastery = pd.DataFrame(mastery_data)
+        topics_scored, expected_sum, weight_sum, coverage_pct, mastery_pct, retention_pct = compute_readiness(topics_with_mastery, today)
+        
+        # Auto-calculate practice blend based on exam proximity and lecture progress
+        # Early in course: low blend (value mastery/study more)
+        # Near exam: high blend (value practice exams more)
+        
+        # Time-based component (0.1 to 0.6 based on days left)
+        if days_left >= 60:
+            time_blend = 0.1
+        elif days_left >= 30:
+            time_blend = 0.1 + (60 - days_left) / 30 * 0.15  # 0.1 to 0.25
+        elif days_left >= 14:
+            time_blend = 0.25 + (30 - days_left) / 16 * 0.15  # 0.25 to 0.4
+        elif days_left >= 7:
+            time_blend = 0.4 + (14 - days_left) / 7 * 0.1  # 0.4 to 0.5
+        elif days_left >= 0:
+            time_blend = 0.5 + (7 - days_left) / 7 * 0.1  # 0.5 to 0.6
+        else:
+            time_blend = 0.6
+        
+        # Lecture progress component (adds up to 0.2 based on % of scheduled lectures attended)
+        lecture_blend = 0.0
+        if not is_retake:
+            all_lectures = read_sql("""
+                SELECT COUNT(*) as total, SUM(CASE WHEN attended=1 THEN 1 ELSE 0 END) as attended
+                FROM scheduled_lectures 
+                WHERE user_id=? AND course_id=?
+            """, (user_id, course_id))
+            if not all_lectures.empty:
+                total_lec = int(all_lectures.iloc[0]["total"] or 0)
+                attended_lec = int(all_lectures.iloc[0]["attended"] or 0)
+                if total_lec > 0:
+                    lecture_progress = attended_lec / total_lec
+                    lecture_blend = lecture_progress * 0.2  # Up to +0.2
+        
+        # Combine: cap at 0.7 (never fully ignore mastery)
+        practice_blend = min(time_blend + lecture_blend, 0.7)
+        
+        # Apply per-topic blending if there are timed signals
+        has_timed_signals = "timed_signal" in topics_scored.columns and topics_scored["timed_signal"].sum() > 0
+        if practice_blend > 0 and has_timed_signals:
+            blended_readiness = []
+            for _, row in topics_scored.iterrows():
+                base_readiness = row["readiness"]
+                timed_sig = row.get("timed_signal", 0.0) or 0.0
+                if timed_sig > 0:
+                    # Blend: (1-blend)*readiness + blend*timed_signal
+                    blended = (1 - practice_blend) * base_readiness + practice_blend * timed_sig
+                else:
+                    blended = base_readiness
+                blended_readiness.append(blended)
+            topics_scored["blended_readiness"] = blended_readiness
+            topics_scored["expected_points"] = topics_scored["weight_points"] * topics_scored["blended_readiness"]
+            expected_sum = topics_scored["expected_points"].sum()
+            retention_pct = (topics_scored["weight_points"] * topics_scored["blended_readiness"]).sum() / weight_sum if weight_sum > 0 else 0
+
+        base_pred = expected_sum
+        if weight_sum and abs(weight_sum - float(total_marks)) > 1e-6:
+            base_pred *= float(total_marks) / float(weight_sum)
+        pred_marks = base_pred
+        
+        # ============ INCORPORATE ACTUAL MARKS ============
+        # Get actual marks from completed assessments and exams
+        completed_assessments = read_sql("""
+            SELECT marks, actual_marks FROM assessments 
+            WHERE user_id=? AND course_id=? AND actual_marks IS NOT NULL
+        """, (user_id, course_id))
+        
+        completed_exams = read_sql("""
+            SELECT marks, actual_marks FROM exams 
+            WHERE user_id=? AND course_id=? AND actual_marks IS NOT NULL
+        """, (user_id, course_id))
+        
+        # Calculate actual marks earned
+        actual_marks_earned = 0
+        actual_marks_possible = 0
+        
+        if not completed_assessments.empty:
+            actual_marks_earned += completed_assessments["actual_marks"].sum()
+            actual_marks_possible += completed_assessments["marks"].sum()
+        
+        if not completed_exams.empty:
+            actual_marks_earned += completed_exams["actual_marks"].sum()
+            actual_marks_possible += completed_exams["marks"].sum()
+        
+        # Calculate remaining marks to predict
+        remaining_marks = total_marks - actual_marks_possible
+        
+        if actual_marks_possible > 0 and remaining_marks > 0:
+            # Blend actual results with predictions for remaining assessments
+            # pred_marks is based on total_marks, so we need to scale it for remaining only
+            predicted_remaining = (pred_marks / total_marks) * remaining_marks if total_marks > 0 else 0
+            combined_pred = actual_marks_earned + predicted_remaining
+            pred_marks = combined_pred
+            
+            # Show breakdown
+            actual_pct = (actual_marks_earned / actual_marks_possible * 100) if actual_marks_possible > 0 else 0
+            st.info(f"📊 **Grade Breakdown**: Actual: {int(actual_marks_earned)}/{int(actual_marks_possible)} ({actual_pct:.0f}%) + Predicted: {predicted_remaining:.1f}/{remaining_marks}")
+        elif actual_marks_possible > 0 and remaining_marks == 0:
+            # All assessments completed
+            pred_marks = actual_marks_earned
+            actual_pct = (actual_marks_earned / total_marks * 100) if total_marks > 0 else 0
+            st.success(f"✅ **All assessments completed!** Final grade: {int(actual_marks_earned)}/{total_marks} ({actual_pct:.0f}%)")
+
+        # Show prediction mode indicator
+        if has_timed_signals:
+            blend_pct = int(practice_blend * 100)
+            if blend_pct < 25:
+                blend_desc = "📚 **Study Focus** — Predictions weighted toward mastery & review"
+            elif blend_pct < 50:
+                blend_desc = "⚖️ **Balanced** — Mixing mastery with practice performance"
+            else:
+                blend_desc = "🎯 **Practice Focus** — Predictions weighted toward timed attempts"
+            st.caption(f"{blend_desc} (Practice weight: {blend_pct}%)")
+        
+        st.divider()
+        
+        # Main metrics row
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Predicted", f"{pred_marks:.1f} / {total_marks}", delta=f"Target: {target_marks}")
+        c2.metric("Readiness", f"{retention_pct*100:.0f}%")
+        c3.metric("Days left", f"{days_left}" if tracking_date else "N/A")
+        c4.metric("Coverage", f"{coverage_pct*100:.0f}%")
+        
+        # Timed attempts metric
+        if latest_timed_score is not None:
+            c5.metric("Last Practice", f"{latest_timed_score:.0f}%", delta=f"{timed_count_14d} in 14d")
+        else:
+            c5.metric("Last Practice", "—", delta="No attempts yet")
+        
+        if pred_marks < target_marks - 10:
+            status = "🔴 AT RISK"
+        elif pred_marks < target_marks:
+            status = "🟡 BORDERLINE"
+        else:
+            status = "🟢 ON TRACK"
+        st.write(f"**Status:** {status}")
+        
+        # ============ PER-ASSESSMENT BREAKDOWN ============
+        st.subheader("📊 Assessment Breakdown")
+        
+        all_assessments = read_sql("""
+            SELECT id, assessment_name, assessment_type, marks, actual_marks, progress_pct, due_date, is_timed
+            FROM assessments WHERE user_id=? AND course_id=? ORDER BY due_date, id
+        """, (user_id, course_id))
+        
+        if not all_assessments.empty:
+            # Calculate predicted marks per assessment
+            avg_readiness = retention_pct if weight_sum > 0 else 0.5
+            
+            breakdown_data = []
+            for _, asmt in all_assessments.iterrows():
+                asmt_marks = asmt["marks"]
+                actual = asmt["actual_marks"]
+                progress = asmt["progress_pct"] or 0
+                is_timed = asmt["is_timed"] == 1
+                
+                if pd.notna(actual):
+                    # Already completed
+                    predicted = actual
+                    status_icon = "✅"
+                    status_text = f"Completed: {int(actual)}/{asmt_marks}"
+                elif is_timed:
+                    # Exam - use readiness
+                    predicted = asmt_marks * avg_readiness
+                    status_icon = "📝"
+                    pct = int(avg_readiness * 100)
+                    status_text = f"Predicted: {predicted:.0f}/{asmt_marks} ({pct}%)"
+                else:
+                    # Assignment - use progress + readiness blend
+                    if progress >= 100:
+                        predicted = asmt_marks * avg_readiness
+                        status_icon = "📤"
+                        status_text = f"Ready to submit: ~{predicted:.0f}/{asmt_marks}"
+                    else:
+                        # Partial progress - scale prediction
+                        progress_factor = progress / 100
+                        predicted = asmt_marks * (0.5 + 0.5 * progress_factor) * avg_readiness
+                        status_icon = "🔄"
+                        status_text = f"In progress ({progress}%): ~{predicted:.0f}/{asmt_marks}"
+                
+                breakdown_data.append({
+                    "": status_icon,
+                    "Assessment": asmt["assessment_name"],
+                    "Type": asmt["assessment_type"],
+                    "Marks": f"{int(asmt_marks)}",
+                    "Status": status_text
+                })
+            
+            breakdown_df = pd.DataFrame(breakdown_data)
+            st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+        
+        st.subheader("💡 Recommendations")
+        topics_scored["gap_score"] = topics_scored["weight_points"] * (1.0 - topics_scored["readiness"])
+        recs = generate_recommendations(topics_scored, upcoming_lectures, days_left, today, is_retake)
+        for rec in recs:
+            st.markdown(f"- {rec}")
+        
+        # ============ STUDY PLAN GENERATOR ============
+        st.subheader("📅 7-Day Study Plan")
+        
+        # Get settings from session state
+        hours_per_week = st.session_state.get("hours_per_week", 10)
+        session_length = st.session_state.get("session_length", 60)
+        
+        # Calculate total sessions available
+        total_mins_per_week = hours_per_week * 60
+        num_sessions = max(1, total_mins_per_week // session_length)
+        
+        # Determine session types based on days_left
+        timed_sessions = 1 if days_left < 30 else 0
+        mixed_sessions = 2 if days_left < 21 else (1 if days_left < 45 else 0)
+        topic_sessions = max(1, num_sessions - timed_sessions - mixed_sessions)
+        
+        # Get topics sorted by gap_score
+        gaps_for_plan = topics_scored.sort_values("gap_score", ascending=False).copy()
+        
+        if not gaps_for_plan.empty and gaps_for_plan["gap_score"].sum() > 0:
+            # Normalize gap_scores to allocate sessions proportionally
+            gaps_for_plan["session_share"] = gaps_for_plan["gap_score"] / gaps_for_plan["gap_score"].sum()
+            gaps_for_plan["allocated_sessions"] = (gaps_for_plan["session_share"] * topic_sessions).round().astype(int)
+            
+            # Ensure at least 1 session for top gaps, redistribute if needed
+            if gaps_for_plan["allocated_sessions"].sum() < topic_sessions:
+                # Add remaining to top gap topics
+                remaining = topic_sessions - gaps_for_plan["allocated_sessions"].sum()
+                for i in range(int(remaining)):
+                    idx = i % len(gaps_for_plan)
+                    gaps_for_plan.iloc[idx, gaps_for_plan.columns.get_loc("allocated_sessions")] += 1
+            
+            # Build the plan
+            plan = []
+            day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            session_idx = 0
+            
+            # Distribute topic review sessions
+            for _, row in gaps_for_plan.iterrows():
+                topic_name = row["topic_name"]
+                mastery = row["mastery"]
+                sessions_for_topic = int(row["allocated_sessions"])
+                
+                for _ in range(sessions_for_topic):
+                    if session_idx >= num_sessions:
+                        break
+                    day = day_names[session_idx % 7]
+                    # Determine session type based on mastery
+                    if mastery < 2:
+                        session_type = "📖 Review"
+                    elif mastery < 4:
+                        session_type = "✏️ Exercises"
+                    else:
+                        session_type = "🔄 Refresh"
+                    
+                    plan.append({
+                        "Day": day,
+                        "Topic": topic_name,
+                        "Type": session_type,
+                        "Duration": f"{session_length} mins"
+                    })
+                    session_idx += 1
+            
+            # Add mixed practice sessions
+            for i in range(mixed_sessions):
+                if session_idx >= num_sessions:
+                    break
+                day = day_names[session_idx % 7]
+                top_3_topics = ", ".join(gaps_for_plan.head(3)["topic_name"].tolist())
+                plan.append({
+                    "Day": day,
+                    "Topic": f"Mixed: {top_3_topics}",
+                    "Type": "🎯 Mixed Practice",
+                    "Duration": f"{session_length} mins"
+                })
+                session_idx += 1
+            
+            # Add timed attempt sessions
+            for i in range(timed_sessions):
+                if session_idx >= num_sessions:
+                    break
+                day = day_names[session_idx % 7]
+                plan.append({
+                    "Day": day,
+                    "Topic": "Full Paper / Past Exam",
+                    "Type": "⏱️ Timed Attempt",
+                    "Duration": f"{session_length * 2} mins"  # Timed attempts are longer
+                })
+                session_idx += 1
+            
+            # Sort by day order
+            day_order = {d: i for i, d in enumerate(day_names)}
+            plan_df = pd.DataFrame(plan)
+            if not plan_df.empty:
+                plan_df["day_order"] = plan_df["Day"].map(day_order)
+                plan_df = plan_df.sort_values("day_order").drop("day_order", axis=1).reset_index(drop=True)
+                
+                # Display the plan
+                st.dataframe(
+                    plan_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Day": st.column_config.TextColumn("📆 Day"),
+                        "Topic": st.column_config.TextColumn("📚 Topic"),
+                        "Type": st.column_config.TextColumn("🎯 Session Type"),
+                        "Duration": st.column_config.TextColumn("⏱️ Duration"),
+                    }
+                )
+                
+                # Plan summary
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.caption(f"📊 **{len(plan_df)} sessions** this week")
+                with col2:
+                    total_study_time = sum([int(d.split()[0]) for d in plan_df["Duration"]])
+                    st.caption(f"⏱️ **{total_study_time // 60}h {total_study_time % 60}m** total")
+                with col3:
+                    st.caption(f"🎯 Prioritizing: **{gaps_for_plan.iloc[0]['topic_name']}**")
+                
+                # Export button
+                csv_data = plan_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "📥 Export Plan as CSV",
+                    csv_data,
+                    f"study_plan_{selected_course.replace(' ', '_')}.csv",
+                    "text/csv",
+                    key="download_study_plan"
+                )
+        else:
+            st.info("Add topics with weights to generate a study plan.")
+        
+        st.subheader("🎯 Top Gaps")
+        gaps = topics_scored.sort_values("gap_score", ascending=False).head(6)
+        st.dataframe(
+            gaps[["topic_name", "weight_points", "mastery", "exercises", "study_sessions", "readiness", "gap_score"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
+                "readiness": st.column_config.ProgressColumn("Readiness", format="%.0f%%", min_value=0, max_value=1),
+            }
+        )
+        
+        if not is_retake and not upcoming_lectures.empty:
+            st.subheader("📅 Upcoming Lectures")
+            upcoming_lectures["lecture_date"] = pd.to_datetime(upcoming_lectures["lecture_date"])
+            st.dataframe(
+                upcoming_lectures[["lecture_date", "lecture_time", "topics_planned"]].head(5),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "lecture_date": st.column_config.DateColumn("Date", format="ddd DD/MM"),
+                }
+            )
+        
+        st.subheader("📋 All Topics")
+        if is_retake:
+            topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "readiness"]
+        else:
+            topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "lectures", "readiness"]
+        st.dataframe(
+            topics_scored[topics_display_cols],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
+                "readiness": st.column_config.ProgressColumn("Readiness", format="%.0f%%", min_value=0, max_value=1),
+            }
+        )
+
+# ============ ASSESSMENTS TAB ============
+with tabs[1]:
+    st.subheader("📋 Course Assessments")
+    st.caption("Define exams, assignments, projects, and quizzes. Total marks = sum of all assessments.")
+    
+    # Ensure default assessment exists
+    ensure_default_assessment(user_id, course_id)
+    
+    # Add new assessment form
+    st.write("**Add New Assessment:**")
+    with st.form("add_assessment"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            asmt_name = st.text_input("Assessment name *", placeholder="e.g., Midterm Exam")
+            asmt_type = st.selectbox("Type", ["Exam", "Assignment", "Project", "Quiz", "Other"])
+        with col2:
+            asmt_marks = st.number_input("Marks *", min_value=1, value=50, help="How many marks is this worth?")
+            asmt_due = st.date_input("Due date (optional)", value=None)
+        with col3:
+            asmt_timed = st.checkbox("⏱️ Timed (exam-like)", value=True, 
+                                     help="Check for exams/quizzes, uncheck for assignments/projects")
+            asmt_notes = st.text_input("Notes (optional)")
+        
+        if st.form_submit_button("➕ Add Assessment", type="primary"):
+            if asmt_name.strip():
+                execute_returning(
+                    """INSERT INTO assessments(user_id, course_id, assessment_name, assessment_type, marks, due_date, is_timed, notes)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (user_id, course_id, asmt_name.strip(), asmt_type, asmt_marks, 
+                     str(asmt_due) if asmt_due else None, 1 if asmt_timed else 0, asmt_notes)
+                )
+                st.success(f"Added: {asmt_name} ({asmt_marks} marks)")
+                st.rerun()
+            else:
+                st.error("Please enter an assessment name.")
+    
+    st.divider()
+    
+    # Display existing assessments
+    assessments_df = read_sql("""
+        SELECT id, assessment_name, assessment_type, marks, actual_marks, progress_pct, due_date, is_timed, notes 
+        FROM assessments WHERE user_id=? AND course_id=? ORDER BY due_date, id
+    """, (user_id, course_id))
+    
+    if not assessments_df.empty:
+        # Calculate completed vs pending
+        completed_count = assessments_df["actual_marks"].notna().sum()
+        total_marks = assessments_df["marks"].sum()
+        actual_earned = assessments_df["actual_marks"].fillna(0).sum()
+        
+        st.write(f"**Your Assessments ({len(assessments_df)} total, {total_marks} marks possible):**")
+        if completed_count > 0:
+            st.caption(f"✅ {completed_count} completed — Actual marks earned: **{int(actual_earned)}**")
+        
+        # Convert date for display
+        assessments_df["due_date"] = pd.to_datetime(assessments_df["due_date"], errors="coerce")
+        assessments_df["delete"] = False
+        # Ensure progress_pct has default value
+        if "progress_pct" not in assessments_df.columns:
+            assessments_df["progress_pct"] = 0
+        assessments_df["progress_pct"] = assessments_df["progress_pct"].fillna(0).astype(int)
+        
+        edited_assessments = st.data_editor(
+            assessments_df[["id", "assessment_name", "assessment_type", "marks", "actual_marks", "progress_pct", "due_date", "is_timed", "notes", "delete"]],
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "assessment_name": st.column_config.TextColumn("Name"),
+                "assessment_type": st.column_config.SelectboxColumn("Type", options=["Exam", "Assignment", "Project", "Quiz", "Other"]),
+                "marks": st.column_config.NumberColumn("Max Marks", min_value=1),
+                "actual_marks": st.column_config.NumberColumn("Actual Marks", min_value=0, help="Enter your score once completed"),
+                "progress_pct": st.column_config.ProgressColumn("Progress %", format="%d%%", min_value=0, max_value=100, help="Work progress (for assignments)"),
+                "due_date": st.column_config.DateColumn("Due Date"),
+                "is_timed": st.column_config.CheckboxColumn("Timed?"),
+                "notes": st.column_config.TextColumn("Notes"),
+                "delete": st.column_config.CheckboxColumn("Delete?")
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="assessments_editor"
+        )
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Save Changes"):
+                for _, row in edited_assessments.iterrows():
+                    if not row["delete"]:
+                        due_str = str(row["due_date"].date()) if pd.notna(row["due_date"]) else None
+                        actual = int(row["actual_marks"]) if pd.notna(row["actual_marks"]) else None
+                        progress = int(row["progress_pct"]) if pd.notna(row["progress_pct"]) else 0
+                        execute(
+                            """UPDATE assessments SET assessment_name=?, assessment_type=?, marks=?, 
+                               actual_marks=?, progress_pct=?, due_date=?, is_timed=?, notes=? WHERE id=? AND user_id=?""",
+                            (row["assessment_name"], row["assessment_type"], int(row["marks"]),
+                             actual, progress, due_str, 1 if row["is_timed"] else 0, row["notes"], int(row["id"]), user_id)
+                        )
+                st.success("Changes saved!")
+                st.rerun()
+        with col2:
+            if st.button("🗑️ Delete Selected"):
+                to_delete = edited_assessments[edited_assessments["delete"] == True]["id"].tolist()
+                if to_delete:
+                    for aid in to_delete:
+                        execute("DELETE FROM assessments WHERE id=? AND user_id=?", (int(aid), user_id))
+                    st.success(f"Deleted {len(to_delete)} assessment(s)!")
+                    st.rerun()
+        
+        # ============ ASSIGNMENT WORK TRACKING ============
+        st.divider()
+        st.subheader("📝 Log Assignment Work")
+        st.caption("Track work sessions for assignments and projects to monitor progress.")
+        
+        # Get non-timed assessments (assignments/projects)
+        assignment_options = assessments_df[assessments_df["is_timed"] == 0][["id", "assessment_name"]].values.tolist()
+        
+        if assignment_options:
+            with st.form("log_assignment_work"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    work_assessment = st.selectbox(
+                        "Select Assignment/Project",
+                        options=[a[0] for a in assignment_options],
+                        format_func=lambda x: next((a[1] for a in assignment_options if a[0] == x), str(x))
+                    )
+                    work_date = st.date_input("Date", value=date.today())
+                with col2:
+                    work_duration = st.number_input("Duration (minutes)", min_value=5, value=60, step=15)
+                    work_type = st.selectbox("Work Type", ["Research", "Writing", "Coding", "Review", "Editing", "Other"])
+                
+                work_desc = st.text_input("Description (optional)", placeholder="What did you work on?")
+                work_progress = st.slider("Progress added (%)", min_value=0, max_value=50, value=10, 
+                                         help="How much progress did this session add?")
+                
+                if st.form_submit_button("📝 Log Work Session", type="primary"):
+                    execute_returning(
+                        """INSERT INTO assignment_work(user_id, assessment_id, work_date, duration_mins, work_type, description, progress_added)
+                           VALUES(?,?,?,?,?,?,?)""",
+                        (user_id, work_assessment, str(work_date), work_duration, work_type, work_desc, work_progress)
+                    )
+                    # Update assessment progress
+                    current_progress = fetchone("SELECT progress_pct FROM assessments WHERE id=?", (work_assessment,))
+                    new_progress = min(100, (current_progress[0] or 0) + work_progress)
+                    execute("UPDATE assessments SET progress_pct=? WHERE id=? AND user_id=?", 
+                           (new_progress, work_assessment, user_id))
+                    st.success(f"Work logged! Progress updated to {new_progress}%")
+                    st.rerun()
+            
+            # Show work history
+            work_history = read_sql("""
+                SELECT aw.id, a.assessment_name, aw.work_date, aw.duration_mins, aw.work_type, aw.description, aw.progress_added
+                FROM assignment_work aw
+                JOIN assessments a ON aw.assessment_id = a.id
+                WHERE aw.user_id=? AND a.course_id=?
+                ORDER BY aw.work_date DESC
+                LIMIT 10
+            """, (user_id, course_id))
+            
+            if not work_history.empty:
+                st.write("**Recent Work Sessions:**")
+                total_hours = work_history["duration_mins"].sum() / 60
+                st.caption(f"Total time logged: **{total_hours:.1f} hours**")
+                st.dataframe(
+                    work_history[["assessment_name", "work_date", "duration_mins", "work_type", "description", "progress_added"]],
+                    column_config={
+                        "assessment_name": "Assignment",
+                        "work_date": "Date",
+                        "duration_mins": st.column_config.NumberColumn("Minutes"),
+                        "work_type": "Type",
+                        "description": "Description",
+                        "progress_added": st.column_config.NumberColumn("Progress +%")
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+        else:
+            st.info("💡 Add non-timed assessments (Assignments/Projects) above to track work progress.")
+    else:
+        st.info("No assessments yet. Add your first one above!")
+
+# ============ EXAMS TAB ============
+with tabs[2]:
+    st.subheader("📅 Manage Exams")
+    st.caption("Add multiple exams per course, each with its own marks value.")
+    
+    exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date", 
+                        (user_id, course_id))
+    
+    with st.form("add_exam"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            exam_name = st.text_input("Exam name", placeholder="e.g., Midterm, Final Exam")
+        with col2:
+            exam_date_input = st.date_input("Exam date", value=date.today() + timedelta(days=60))
+        with col3:
+            exam_marks = st.number_input("Marks", min_value=1, value=100, help="How many marks is this exam worth?")
+        
+        is_retake_input = st.checkbox("🔄 This is a retake (no lectures)", value=False, 
+                                      help="Retake exams exclude lectures from readiness calculations")
+        
+        if st.form_submit_button("➕ Add Exam", type="primary"):
+            if exam_name.strip():
+                execute_returning("INSERT INTO exams(user_id, course_id, exam_name, exam_date, marks, is_retake) VALUES(?,?,?,?,?,?)",
+                                 (user_id, course_id, exam_name.strip(), str(exam_date_input), exam_marks, 1 if is_retake_input else 0))
+                st.success(f"Exam '{exam_name}' added ({exam_marks} marks)!")
+                st.rerun()
+            else:
+                st.error("Please enter an exam name.")
+    
+    if not exams_df.empty:
+        st.divider()
+        
+        # Calculate completed vs pending
+        if "actual_marks" not in exams_df.columns:
+            exams_df["actual_marks"] = None
+        completed_count = exams_df["actual_marks"].notna().sum()
+        total_exam_marks = exams_df["marks"].sum() if "marks" in exams_df.columns else 0
+        actual_earned = exams_df["actual_marks"].fillna(0).sum()
+        
+        st.write(f"**Your Exams ({len(exams_df)} total):**")
+        if completed_count > 0:
+            st.caption(f"✅ {completed_count} completed — Actual marks earned: **{int(actual_earned)}**")
+        
+        exams_df["exam_date"] = pd.to_datetime(exams_df["exam_date"])
+        exams_df["is_retake"] = exams_df["is_retake"].fillna(0).astype(int).apply(lambda x: x == 1)
+        # Handle missing marks column for backward compatibility
+        if "marks" not in exams_df.columns:
+            exams_df["marks"] = 100
+        exams_df["marks"] = exams_df["marks"].fillna(100).astype(int)
+        exams_df["delete"] = False
+        
+        edited_exams = st.data_editor(
+            exams_df[["id", "exam_name", "exam_date", "marks", "actual_marks", "is_retake", "delete"]],
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "exam_name": st.column_config.TextColumn("Exam Name"),
+                "exam_date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
+                "marks": st.column_config.NumberColumn("Max Marks", min_value=1),
+                "actual_marks": st.column_config.NumberColumn("Actual Marks", min_value=0, help="Enter your score once completed"),
+                "is_retake": st.column_config.CheckboxColumn("🔄 Retake"),
+                "delete": st.column_config.CheckboxColumn("Delete?"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="exams_editor"
+        )
+        
+        # Summary
+        st.caption(f"📊 Total exam marks: **{total_exam_marks}**")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Save Exam Changes"):
+                for _, r in edited_exams.iterrows():
+                    if not r.get("delete", False):
+                        actual = int(r["actual_marks"]) if pd.notna(r["actual_marks"]) else None
+                        execute("UPDATE exams SET exam_name=?, exam_date=?, marks=?, actual_marks=?, is_retake=? WHERE id=? AND user_id=?",
+                               (r["exam_name"], pd.to_datetime(r["exam_date"]).strftime("%Y-%m-%d"), 
+                                int(r["marks"]), actual, 1 if r["is_retake"] else 0, int(r["id"]), user_id))
+                st.success("Exams updated!")
+                st.rerun()
+        with col2:
+            if st.button("🗑️ Delete Selected Exams"):
+                to_delete = edited_exams[edited_exams["delete"] == True]["id"].tolist()
+                if to_delete:
+                    for eid in to_delete:
+                        execute("DELETE FROM exams WHERE id=? AND user_id=?", (int(eid), user_id))
+                    st.success(f"Deleted {len(to_delete)} exam(s)!")
+                    st.rerun()
+    else:
+        st.info("No exams added yet. Add your first exam above!")
+
+# ============ TOPICS TAB ============
+with tabs[3]:
+    st.subheader("📖 Manage Topics")
+    
+    topics_df = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id", 
+                         (user_id, course_id))
+    
+    with st.form("add_topic"):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            topic_name = st.text_input("Topic name", placeholder="e.g., Supply and Demand")
+        with col2:
+            weight = st.number_input("Weight (points)", min_value=0, value=10)
+        
+        if st.form_submit_button("➕ Add Topic"):
+            if topic_name.strip():
+                execute_returning("INSERT INTO topics(user_id, course_id, topic_name, weight_points) VALUES(?,?,?,?)",
+                                 (user_id, course_id, topic_name.strip(), weight))
+                st.success("Topic added!")
+                st.rerun()
+    
+    if not topics_df.empty:
+        st.write("**Existing Topics:**")
+        edited_topics = st.data_editor(
+            topics_df,
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "topic_name": st.column_config.TextColumn("Topic Name", width="large"),
+                "weight_points": st.column_config.NumberColumn("Weight", min_value=0),
+                "notes": st.column_config.TextColumn("Notes"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="topics_editor"
+        )
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Save Topic Changes"):
+                for _, r in edited_topics.iterrows():
+                    if pd.notna(r["id"]):
+                        execute("UPDATE topics SET topic_name=?, weight_points=?, notes=? WHERE id=? AND user_id=?",
+                               (r["topic_name"], float(r["weight_points"]), r.get("notes"), int(r["id"]), user_id))
+                st.success("Topics updated!")
+                st.rerun()
+        with col2:
+            topic_to_delete = st.selectbox("Delete topic", topics_df["topic_name"].tolist(), key="del_topic")
+            if st.button("🗑️ Delete Selected Topic"):
+                topic_id_del = topics_df.loc[topics_df["topic_name"] == topic_to_delete, "id"].iloc[0]
+                execute("DELETE FROM study_sessions WHERE topic_id=?", (int(topic_id_del),))
+                execute("DELETE FROM exercises WHERE topic_id=?", (int(topic_id_del),))
+                execute("DELETE FROM topics WHERE id=? AND user_id=?", (int(topic_id_del), user_id))
+                st.success("Topic and related data deleted!")
+                st.rerun()
+
+# ============ IMPORT TOPICS TAB ============
+with tabs[4]:
+    st.subheader("📥 Import Topics from PDF")
+    st.caption("Upload lecture slide PDFs to automatically extract topic names.")
+    
+    if not HAS_PYMUPDF:
+        st.error("⚠️ PDF extraction requires PyMuPDF. Install with: `pip install pymupdf`")
+    else:
+        # Initialize session state for imported topics
+        if "imported_topics" not in st.session_state:
+            st.session_state.imported_topics = None
+        if "import_stats" not in st.session_state:
+            st.session_state.import_stats = None
+        
+        # File uploader
+        st.write("**Step 1: Upload PDF Files**")
+        uploaded_files = st.file_uploader(
+            "Select lecture slide PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            help="Upload one or more PDF files containing lecture slides"
+        )
+        
+        if uploaded_files:
+            st.caption(f"📎 {len(uploaded_files)} file(s) selected")
+            
+            # Extract topics button
+            if st.button("🔍 Extract Topics", type="primary"):
+                with st.spinner("Extracting topics from PDFs..."):
+                    pdf_files = [(f.read(), f.name) for f in uploaded_files]
+                    # Reset file pointers
+                    for f in uploaded_files:
+                        f.seek(0)
+                    
+                    try:
+                        candidates, stats = extract_and_process_topics(pdf_files)
+                        st.session_state.imported_topics = candidates
+                        st.session_state.import_stats = stats
+                        st.success(f"✅ Extraction complete!")
+                    except Exception as e:
+                        st.error(f"Error extracting topics: {e}")
+                        st.session_state.imported_topics = None
+        
+        # Show extraction results
+        if st.session_state.imported_topics is not None:
+            stats = st.session_state.import_stats
+
+            st.divider()
+            st.write("**Extraction Summary:**")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Files Processed", stats["files_processed"])
+            col2.metric("Pages Scanned", stats["total_pages"])
+            col3.metric("Topics Found", stats.get("final_topics", stats.get("final_candidates", 0)))
+            col4.metric("Adaptive Cap", stats.get("adaptive_cap", "N/A"))
+
+            # Detailed extraction pipeline stats
+            with st.expander("📊 Extraction Pipeline Details"):
+                st.caption("How topics were filtered at each stage:")
+                st.write(f"1. **Raw candidates extracted:** {stats.get('raw_candidates', stats.get('initial_candidates', 0))}")
+                st.write(f"2. **After header filter (>10% of pages removed):** {stats.get('after_header_filter', 'N/A')}")
+                st.write(f"3. **After frequency filter (min 2 or 3% pages):** {stats.get('after_frequency_filter', 'N/A')}")
+                st.write(f"4. **After similarity clustering (90% threshold):** {stats.get('after_clustering', 'N/A')}")
+                st.write(f"5. **After hierarchical merge:** {stats.get('after_hierarchical_merge', 'N/A')}")
+                st.write(f"6. **Final topics (ranked & capped):** {stats.get('final_topics', stats.get('final_candidates', 0))}")
+
+                reduction_pct = 0
+                initial = stats.get('raw_candidates', stats.get('initial_candidates', 0))
+                final = stats.get('final_topics', stats.get('final_candidates', 0))
+                if initial > 0:
+                    reduction_pct = round((1 - final / initial) * 100, 1)
+                st.success(f"✅ Reduced by {reduction_pct}% ({initial} → {final} topics)")
+
+            # Show subtopics if available
+            if stats.get("subtopics") and len(stats["subtopics"]) > 0:
+                show_subtopics = st.checkbox(
+                    f"🔍 Show {len(stats['subtopics'])} subtopic(s) that were merged into parent topics",
+                    value=False
+                )
+                if show_subtopics:
+                    st.caption("These topics were merged hierarchically (e.g., 'Topic I: Part A' → 'Topic')")
+                    subtopics_df = pd.DataFrame(stats["subtopics"])
+                    st.dataframe(
+                        subtopics_df[["topic_name", "parent_topic"]],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+            st.divider()
+            st.write("**Step 2: Review & Edit Topics**")
+            st.caption("Check topics to include, edit names as needed.")
+            
+            # Convert to DataFrame for editing
+            if st.session_state.imported_topics:
+                import_df = pd.DataFrame(st.session_state.imported_topics)
+                import_df["include"] = True
+
+                # Handle both old (confidence) and new (occurrence_count) format
+                if "occurrence_count" in import_df.columns:
+                    import_df["frequency"] = import_df["occurrence_count"]
+                elif "confidence" in import_df.columns:
+                    import_df["frequency"] = import_df["confidence"].round(2)
+                else:
+                    import_df["frequency"] = 1
+
+                # Get existing topics to check for duplicates
+                existing_topics = read_sql(
+                    "SELECT topic_name FROM topics WHERE user_id=? AND course_id=?",
+                    (user_id, course_id)
+                )
+                existing_normalized = set(normalize_text(t) for t in existing_topics["topic_name"].tolist()) if not existing_topics.empty else set()
+
+                # Mark duplicates
+                import_df["is_duplicate"] = import_df["topic_name"].apply(
+                    lambda x: normalize_text(x) in existing_normalized
+                )
+                import_df.loc[import_df["is_duplicate"], "include"] = False
+
+                # Select columns for display
+                display_cols = ["include", "topic_name", "source_file", "frequency", "is_duplicate"]
+                if "has_subtopics" in import_df.columns:
+                    import_df["subtopics"] = import_df.apply(
+                        lambda row: f"✓ ({row['num_subtopics']})" if row.get("has_subtopics") else "",
+                        axis=1
+                    )
+                    display_cols.insert(4, "subtopics")
+
+                edited_imports = st.data_editor(
+                    import_df[display_cols],
+                    column_config={
+                        "include": st.column_config.CheckboxColumn("Include", default=True),
+                        "topic_name": st.column_config.TextColumn("Topic Name"),
+                        "source_file": st.column_config.TextColumn("Source File", disabled=True),
+                        "frequency": st.column_config.NumberColumn("Frequency", help="Number of times this topic appears", disabled=True),
+                        "subtopics": st.column_config.TextColumn("Has Subtopics?", disabled=True),
+                        "is_duplicate": st.column_config.CheckboxColumn("Already Exists?", disabled=True)
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                    key="import_topics_editor"
+                )
+                
+                # Count selections
+                selected_count = edited_imports["include"].sum()
+                duplicate_count = edited_imports["is_duplicate"].sum()
+                
+                if duplicate_count > 0:
+                    st.warning(f"⚠️ {duplicate_count} topic(s) already exist in this course and are unchecked.")
+                
+                st.write(f"**Selected: {selected_count} topic(s)**")
+                
+                st.divider()
+                st.write("**Step 3: Create Topics**")
+                
+                if st.button(f"✅ Create {selected_count} Topics", type="primary", disabled=selected_count == 0):
+                    created = 0
+                    skipped = 0
+                    
+                    # Get existing normalized topics again for final check
+                    existing_topics = read_sql(
+                        "SELECT topic_name FROM topics WHERE user_id=? AND course_id=?",
+                        (user_id, course_id)
+                    )
+                    existing_normalized = set(normalize_text(t) for t in existing_topics["topic_name"].tolist()) if not existing_topics.empty else set()
+                    
+                    for _, row in edited_imports.iterrows():
+                        if not row["include"]:
+                            continue
+                        
+                        topic_name = row["topic_name"].strip()
+                        normalized = normalize_text(topic_name)
+                        
+                        # Skip if already exists
+                        if normalized in existing_normalized:
+                            skipped += 1
+                            continue
+                        
+                        # Insert topic
+                        execute_returning(
+                            "INSERT INTO topics(user_id, course_id, topic_name, weight_points, notes) VALUES(?,?,?,?,?)",
+                            (user_id, course_id, topic_name, 0, f"Imported from: {row['source_file']}")
+                        )
+                        existing_normalized.add(normalized)
+                        created += 1
+                    
+                    # Clear session state
+                    st.session_state.imported_topics = None
+                    st.session_state.import_stats = None
+                    
+                    if created > 0:
+                        st.success(f"✅ Created {created} new topic(s)!")
+                    if skipped > 0:
+                        st.info(f"ℹ️ Skipped {skipped} duplicate(s).")
+                    
+                    st.info("💡 Go to the Topics tab to set weight points for your new topics.")
+                    st.rerun()
+            else:
+                st.info("No topics were extracted. Try uploading different PDF files.")
+            
+            # Clear button
+            if st.button("🔄 Clear & Start Over"):
+                st.session_state.imported_topics = None
+                st.session_state.import_stats = None
+                st.rerun()
+
+# ============ STUDY SESSIONS TAB ============
+with tabs[5]:
+    st.subheader("✏️ Study Sessions")
+    st.caption("Log when you review/study a topic. Quality: 1=distracted, 3=normal, 5=deep focus")
+    
+    topics_df = read_sql("SELECT id, topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name", 
+                         (user_id, course_id))
+    
+    if topics_df.empty:
+        st.warning("Add topics first!")
+    else:
+        with st.form("study_form"):
+            topic_options = topics_df["topic_name"].tolist()
+            selected_topic = st.selectbox("Topic studied", topic_options)
+            topic_id = int(topics_df.loc[topics_df["topic_name"] == selected_topic, "id"].iloc[0])
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                study_date = st.date_input("Date", value=date.today())
+            with col2:
+                duration = st.number_input("Duration (mins)", min_value=5, value=30, step=5)
+            with col3:
+                quality = st.slider("Quality (1-5)", min_value=1, max_value=5, value=3)
+            
+            notes = st.text_area("Notes (optional)")
+            
+            if st.form_submit_button("📝 Save Study Session"):
+                execute_returning("INSERT INTO study_sessions(topic_id, session_date, duration_mins, quality, notes) VALUES(?,?,?,?,?)",
+                                 (topic_id, str(study_date), duration, quality, notes))
+                st.success("Study session logged!")
+                st.rerun()
+        
+        st.subheader("Recent Study Sessions")
+        sessions_df = read_sql("""
+            SELECT s.id, t.topic_name, s.session_date, s.duration_mins, s.quality, s.notes
+            FROM study_sessions s
+            JOIN topics t ON s.topic_id = t.id
+            WHERE t.user_id = ? AND t.course_id = ?
+            ORDER BY s.session_date DESC
+            LIMIT 30
+        """, (user_id, course_id))
+        
+        if not sessions_df.empty:
+            sessions_df["delete"] = False
+            edited_sessions = st.data_editor(
+                sessions_df,
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", disabled=True),
+                    "delete": st.column_config.CheckboxColumn("🗑️ Delete", default=False),
+                },
+                use_container_width=True,
+                hide_index=True,
+                key="sessions_editor"
+            )
+            
+            if st.button("🗑️ Delete Selected Sessions"):
+                to_delete = edited_sessions[edited_sessions["delete"] == True]["id"].tolist()
+                if to_delete:
+                    for sid in to_delete:
+                        execute("DELETE FROM study_sessions WHERE id=?", (int(sid),))
+                    st.success(f"Deleted {len(to_delete)} session(s)!")
+                    st.rerun()
+
+# ============ EXERCISES TAB ============
+with tabs[6]:
+    st.subheader("🏋️ Exercises")
+    st.caption("Log practice questions/exercises completed for a topic.")
+    
+    topics_df = read_sql("SELECT id, topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name", 
+                         (user_id, course_id))
+    
+    if topics_df.empty:
+        st.warning("Add topics first!")
+    else:
+        with st.form("exercise_form"):
+            topic_options = topics_df["topic_name"].tolist()
+            selected_topic = st.selectbox("Topic", topic_options)
+            topic_id = int(topics_df.loc[topics_df["topic_name"] == selected_topic, "id"].iloc[0])
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                ex_date = st.date_input("Date", value=date.today())
+            with col2:
+                total_q = st.number_input("Total questions", min_value=1, value=10)
+            with col3:
+                correct = st.number_input("Correct answers", min_value=0, max_value=100, value=10)
+            
+            source = st.text_input("Source (optional)", placeholder="e.g., 2023 Past Paper")
+            notes = st.text_area("Notes (optional)")
+            
+            if st.form_submit_button("💪 Save Exercises"):
+                execute_returning("INSERT INTO exercises(topic_id, exercise_date, total_questions, correct_answers, source, notes) VALUES(?,?,?,?,?,?)",
+                                 (topic_id, str(ex_date), total_q, min(correct, total_q), source, notes))
+                st.success(f"Logged {min(correct, total_q)}/{total_q} correct!")
+                st.rerun()
+        
+        st.subheader("Recent Exercises")
+        exercises_df = read_sql("""
+            SELECT e.id, t.topic_name, e.exercise_date, e.total_questions, e.correct_answers, e.source
+            FROM exercises e
+            JOIN topics t ON e.topic_id = t.id
+            WHERE t.user_id = ? AND t.course_id = ?
+            ORDER BY e.exercise_date DESC
+            LIMIT 30
+        """, (user_id, course_id))
+        
+        if not exercises_df.empty:
+            exercises_df["score"] = (exercises_df["correct_answers"] / exercises_df["total_questions"] * 100).round(0).astype(int).astype(str) + "%"
+            exercises_df["delete"] = False
+            
+            edited_exercises = st.data_editor(
+                exercises_df,
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", disabled=True),
+                    "delete": st.column_config.CheckboxColumn("🗑️ Delete", default=False),
+                },
+                use_container_width=True,
+                hide_index=True,
+                key="exercises_editor"
+            )
+            
+            if st.button("🗑️ Delete Selected Exercises"):
+                to_delete = edited_exercises[edited_exercises["delete"] == True]["id"].tolist()
+                if to_delete:
+                    for eid in to_delete:
+                        execute("DELETE FROM exercises WHERE id=?", (int(eid),))
+                    st.success(f"Deleted {len(to_delete)} exercise(s)!")
+                    st.rerun()
+
+# ============ TIMED ATTEMPTS TAB ============
+with tabs[7]:
+    st.subheader("⏱️ Timed Practice Attempts")
+    st.caption("Log timed past-paper or practice exam attempts. Performance on specific topics boosts your readiness predictions.")
+    
+    # Get topics for multi-select
+    topics_df_ta = read_sql("SELECT topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name", 
+                            (user_id, course_id))
+    topic_names_ta = topics_df_ta["topic_name"].tolist() if not topics_df_ta.empty else []
+    
+    st.write("**Log New Attempt:**")
+    with st.form("timed_attempt_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            ta_date = st.date_input("Attempt date", value=date.today())
+            ta_source = st.text_input("Source", placeholder="e.g., 2023 Past Paper, Mock Exam 1")
+        with col2:
+            ta_minutes = st.number_input("Duration (minutes)", min_value=1, value=60)
+            ta_score = st.slider("Score (%)", min_value=0, max_value=100, value=70, help="Your percentage score on this attempt")
+        
+        if topic_names_ta:
+            ta_topics = st.multiselect("Topics covered in this attempt", topic_names_ta, 
+                                       help="Select all topics that were tested in this paper/exam")
+        else:
+            ta_topics = []
+            st.warning("Add topics first to tag them in your attempts.")
+        
+        ta_notes = st.text_area("Notes (optional)", placeholder="e.g., Struggled with Q3, ran out of time on last section")
+        
+        if st.form_submit_button("📝 Log Attempt", type="primary"):
+            if ta_source.strip():
+                topics_str = ", ".join(ta_topics) if ta_topics else ""
+                execute_returning(
+                    "INSERT INTO timed_attempts(user_id, course_id, attempt_date, source, minutes, score_pct, topics, notes) VALUES(?,?,?,?,?,?,?,?)",
+                    (user_id, course_id, str(ta_date), ta_source.strip(), ta_minutes, ta_score / 100.0, topics_str, ta_notes)
+                )
+                st.success("Attempt logged! Your readiness predictions have been updated.")
+                st.rerun()
+            else:
+                st.error("Please enter a source for this attempt.")
+    
+    st.divider()
+    
+    # Display existing timed attempts
+    timed_df = read_sql("""
+        SELECT id, attempt_date, source, minutes, score_pct, topics, notes 
+        FROM timed_attempts 
+        WHERE user_id=? AND course_id=? 
+        ORDER BY attempt_date DESC
+    """, (user_id, course_id))
+    
+    if not timed_df.empty:
+        st.write(f"**Your Timed Attempts ({len(timed_df)} total):**")
+        
+        # Convert date column to datetime for data_editor compatibility
+        timed_df["attempt_date"] = pd.to_datetime(timed_df["attempt_date"], errors="coerce")
+        
+        # Add delete column
+        timed_df["delete"] = False
+        timed_df["score_pct"] = (timed_df["score_pct"] * 100).round(0).astype(int)
+        
+        edited_timed = st.data_editor(
+            timed_df[["id", "attempt_date", "source", "minutes", "score_pct", "topics", "notes", "delete"]],
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "attempt_date": st.column_config.DateColumn("Date"),
+                "source": st.column_config.TextColumn("Source"),
+                "minutes": st.column_config.NumberColumn("Mins", min_value=1),
+                "score_pct": st.column_config.ProgressColumn("Score %", format="%d%%", min_value=0, max_value=100),
+                "topics": st.column_config.TextColumn("Topics Covered"),
+                "notes": st.column_config.TextColumn("Notes"),
+                "delete": st.column_config.CheckboxColumn("Delete?")
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="timed_attempts_editor"
+        )
+        
+        if st.button("🗑️ Delete Selected Attempts"):
+            to_delete = edited_timed[edited_timed["delete"] == True]["id"].tolist()
+            if to_delete:
+                for tid in to_delete:
+                    execute("DELETE FROM timed_attempts WHERE id=? AND user_id=?", (int(tid), user_id))
+                st.success(f"Deleted {len(to_delete)} attempt(s)!")
+                st.rerun()
+        
+        # Stats summary
+        st.divider()
+        st.write("**Performance Summary:**")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            avg_score = timed_df["score_pct"].mean()
+            st.metric("Average Score", f"{avg_score:.0f}%")
+        with col2:
+            total_mins = timed_df["minutes"].sum()
+            st.metric("Total Practice Time", f"{total_mins // 60}h {total_mins % 60}m")
+        with col3:
+            recent_count = len(timed_df[pd.to_datetime(timed_df["attempt_date"]).dt.date >= (date.today() - timedelta(days=14))])
+            st.metric("Last 14 Days", f"{recent_count} attempts")
+    else:
+        st.info("No timed attempts logged yet. Log your first practice exam above!")
+
+# ============ LECTURE CALENDAR TAB ============
+with tabs[8]:
+    st.subheader("🎓 Lecture Calendar")
+    st.caption("Schedule lectures and track attendance. Topics in lectures boost mastery when attended.")
+    
+    topics_df = read_sql("SELECT topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name", 
+                         (user_id, course_id))
+    topic_names = topics_df["topic_name"].tolist() if not topics_df.empty else []
+    
+    st.write("**Schedule New Lecture:**")
+    with st.form("lecture_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            l_date = st.date_input("Lecture date", value=date.today())
+        with col2:
+            l_time = st.text_input("Time (optional)", placeholder="e.g., 10:00 AM")
+        
+        topics_planned = st.text_input("Topics to be covered (comma separated)", 
+                                       placeholder=", ".join(topic_names[:3]) if topic_names else "e.g., Topic A, Topic B")
+        notes = st.text_area("Notes (optional)")
+        
+        if st.form_submit_button("📅 Schedule Lecture"):
+            execute_returning("INSERT INTO scheduled_lectures(user_id, course_id, lecture_date, lecture_time, topics_planned, notes) VALUES(?,?,?,?,?,?)",
+                             (user_id, course_id, str(l_date), l_time, topics_planned, notes))
+            st.success("Lecture scheduled!")
+            st.rerun()
+    
+    lectures_df = read_sql("""
+        SELECT * FROM scheduled_lectures 
+        WHERE user_id=? AND course_id=? 
+        ORDER BY lecture_date
+    """, (user_id, course_id))
+    
+    if not lectures_df.empty:
+        today = date.today()
+        
+        lectures_df["lecture_date_parsed"] = pd.to_datetime(lectures_df["lecture_date"])
+        upcoming = lectures_df[lectures_df["lecture_date_parsed"].dt.date >= today].copy()
+        past = lectures_df[lectures_df["lecture_date_parsed"].dt.date < today].copy()
+        
+        st.write("**📅 Upcoming Lectures:**")
+        if not upcoming.empty:
+            upcoming["attended"] = upcoming["attended"].fillna(0).astype(int)
+            upcoming_display = upcoming[["id", "lecture_date", "lecture_time", "topics_planned", "notes"]].copy()
+            upcoming_display["lecture_date"] = pd.to_datetime(upcoming_display["lecture_date"])
+            
+            edited_upcoming = st.data_editor(
+                upcoming_display,
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", disabled=True),
+                    "lecture_date": st.column_config.DateColumn("Date", format="ddd DD/MM"),
+                    "lecture_time": st.column_config.TextColumn("Time"),
+                    "topics_planned": st.column_config.TextColumn("Topics"),
+                },
+                use_container_width=True,
+                hide_index=True,
+                key="upcoming_lectures"
+            )
+            
+            if st.button("💾 Save Upcoming Lecture Changes"):
+                for _, r in edited_upcoming.iterrows():
+                    execute("UPDATE scheduled_lectures SET lecture_date=?, lecture_time=?, topics_planned=?, notes=? WHERE id=? AND user_id=?",
+                           (pd.to_datetime(r["lecture_date"]).strftime("%Y-%m-%d"), r["lecture_time"], r["topics_planned"], r.get("notes"), int(r["id"]), user_id))
+                st.success("Updated!")
+                st.rerun()
+        else:
+            st.info("No upcoming lectures scheduled.")
+        
+        st.write("**📋 Past Lectures (mark attendance):**")
+        if not past.empty:
+            past["attended"] = past["attended"].apply(lambda x: True if x == 1 else False)
+            past_display = past[["id", "lecture_date", "lecture_time", "topics_planned", "attended"]].copy()
+            past_display["lecture_date"] = pd.to_datetime(past_display["lecture_date"])
+            
+            edited_past = st.data_editor(
+                past_display,
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", disabled=True),
+                    "lecture_date": st.column_config.DateColumn("Date", format="ddd DD/MM", disabled=True),
+                    "lecture_time": st.column_config.TextColumn("Time", disabled=True),
+                    "topics_planned": st.column_config.TextColumn("Topics", disabled=True),
+                    "attended": st.column_config.CheckboxColumn("✅ Attended"),
+                },
+                use_container_width=True,
+                hide_index=True,
+                key="past_lectures"
+            )
+            
+            if st.button("💾 Save Attendance"):
+                for _, r in edited_past.iterrows():
+                    execute("UPDATE scheduled_lectures SET attended=? WHERE id=? AND user_id=?",
+                           (1 if r["attended"] else 0, int(r["id"]), user_id))
+                st.success("Attendance saved! Mastery updated.")
+                st.rerun()
+        else:
+            st.info("No past lectures.")
+        
+        st.write("**🗑️ Delete Lectures:**")
+        lec_options = lectures_df.apply(lambda r: f"{r['lecture_date']} - {r['topics_planned'][:30] if r['topics_planned'] else 'No topics'}", axis=1).tolist()
+        lec_to_delete = st.selectbox("Select lecture to delete", lec_options, key="del_lec")
+        if st.button("🗑️ Delete Selected Lecture"):
+            lec_idx = lec_options.index(lec_to_delete)
+            lec_id = int(lectures_df.iloc[lec_idx]["id"])
+            execute("DELETE FROM scheduled_lectures WHERE id=? AND user_id=?", (lec_id, user_id))
+            st.success("Lecture deleted!")
+            st.rerun()
+    else:
+        st.info("No lectures scheduled yet. Add one above!")
+
+# ============ EXPORT TAB ============
+with tabs[9]:
+    st.subheader("📤 Export Data")
+    
+    topics_export = read_sql("SELECT * FROM topics WHERE user_id=? AND course_id=?", (user_id, course_id))
+    sessions_export = read_sql("""
+        SELECT s.*, t.topic_name FROM study_sessions s
+        JOIN topics t ON s.topic_id = t.id
+        WHERE t.user_id = ? AND t.course_id = ?
+    """, (user_id, course_id))
+    exercises_export = read_sql("""
+        SELECT e.*, t.topic_name FROM exercises e
+        JOIN topics t ON e.topic_id = t.id
+        WHERE t.user_id = ? AND t.course_id = ?
+    """, (user_id, course_id))
+    lectures_export = read_sql("SELECT * FROM scheduled_lectures WHERE user_id=? AND course_id=?", (user_id, course_id))
+    exams_export = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=?", (user_id, course_id))
+    timed_export = read_sql("SELECT * FROM timed_attempts WHERE user_id=? AND course_id=?", (user_id, course_id))
+    assessments_export = read_sql("SELECT * FROM assessments WHERE user_id=? AND course_id=?", (user_id, course_id))
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button("📥 Topics", topics_export.to_csv(index=False).encode("utf-8"), "topics.csv", "text/csv")
+        st.download_button("📥 Study Sessions", sessions_export.to_csv(index=False).encode("utf-8"), "study_sessions.csv", "text/csv")
+        st.download_button("📥 Exercises", exercises_export.to_csv(index=False).encode("utf-8"), "exercises.csv", "text/csv")
+        st.download_button("📥 Assessments", assessments_export.to_csv(index=False).encode("utf-8"), "assessments.csv", "text/csv")
+    with col2:
+        st.download_button("📥 Lectures", lectures_export.to_csv(index=False).encode("utf-8"), "lectures.csv", "text/csv")
+        st.download_button("📥 Exams", exams_export.to_csv(index=False).encode("utf-8"), "exams.csv", "text/csv")
+        st.download_button("📥 Timed Attempts", timed_export.to_csv(index=False).encode("utf-8"), "timed_attempts.csv", "text/csv")
