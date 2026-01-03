@@ -323,7 +323,8 @@ if HAS_COOKIE_MANAGER:
                 st.session_state.user_email = token_data["email"]
                 st.session_state.is_admin = False  # Regular user login
                 update_last_login(token_data["user_id"])
-                # Note: We don't rerun here to avoid infinite loop
+                # Rerun to show authenticated page
+                st.rerun()
             else:
                 # Token is invalid/expired - delete cookie
                 cookie_manager.delete("auth_token")
@@ -391,13 +392,33 @@ def show_auth_page():
 
         # Safe debug info
         if HAS_COOKIE_MANAGER:
-            with st.expander("🔧 Debug: Cookie Status", expanded=False):
-                has_cookie = cookie_manager.get("auth_token") is not None
-                st.write(f"**Auth cookie present:** `{has_cookie}`")
-                if has_cookie:
-                    st.caption("✓ Cookie detected (auto-login enabled)")
+            with st.expander("🔧 Debug: Auth Status", expanded=False):
+                # Check session state
+                has_session_user_id = st.session_state.user_id is not None
+                st.write(f"**Session state has user_id:** `{has_session_user_id}`")
+
+                # Check cookie
+                auth_token = cookie_manager.get("auth_token")
+                has_cookie = auth_token is not None
+                st.write(f"**Auth cookie exists:** `{has_cookie}`")
+
+                # Check DB token validity (only if cookie exists)
+                has_valid_db_token = False
+                if has_cookie and auth_token:
+                    token_data = validate_token(auth_token)
+                    has_valid_db_token = token_data is not None
+                st.write(f"**Valid token in DB:** `{has_valid_db_token}`")
+
+                # Summary
+                st.divider()
+                if has_session_user_id:
+                    st.caption("✓ User is logged in (session active)")
+                elif has_valid_db_token:
+                    st.caption("⚠️ Valid token exists but session not set (should auto-login)")
+                elif has_cookie:
+                    st.caption("⚠️ Cookie exists but token is invalid/expired")
                 else:
-                    st.caption("ℹ️ No cookie found (manual login required)")
+                    st.caption("ℹ️ Not logged in (manual login required)")
     
     # Signup tab
     with signup_tab:
