@@ -836,8 +836,33 @@ target_marks = int(course_row["target_marks"]) if course_row["target_marks"] els
 st.title("📈 Exam Readiness Predictor")
 st.caption("Auto-calculated mastery from study sessions, exercises, and lectures.")
 
-# ============ TABS ============
-tabs = st.tabs(["📊 Dashboard", "📋 Assessments", "📅 Exams", "📖 Topics", "📥 Import Topics", "✏️ Study Sessions", "🏋️ Exercises", "⏱️ Timed Attempts", "🎓 Lecture Calendar", "📤 Export"])
+# ============ TABS (compact labels for mobile-safe layout) ============
+tabs = st.tabs(["📊 Dash", "📋 Assess", "📅 Exams", "📖 Topics", "📥 Import", "✏️ Study", "🏋️ Exercise", "⏱️ Timed", "🎓 Calendar", "📤 Export"])
+
+# CSS to make tabs wrap on smaller screens instead of overflow/truncate
+st.markdown("""
+<style>
+    /* Allow tabs to wrap instead of overflow */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 2px;
+        flex-wrap: wrap;
+    }
+    .stTabs [data-baseweb="tab"] {
+        padding: 8px 12px;
+        font-size: 0.85rem;
+    }
+    /* Compact tabs on mobile */
+    @media (max-width: 768px) {
+        .stTabs [data-baseweb="tab-list"] {
+            justify-content: center;
+        }
+        .stTabs [data-baseweb="tab"] {
+            padding: 6px 8px;
+            font-size: 0.75rem;
+        }
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ============ DASHBOARD ============
 with tabs[0]:
