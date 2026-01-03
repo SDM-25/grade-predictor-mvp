@@ -824,16 +824,23 @@ def verify_admin(username: str, password: str) -> bool:
         if not admin_username:
             return False
 
+        # Strip whitespace from entered values and secret values
+        username = username.strip() if username else ""
+        password = password.strip() if password else ""
+        admin_username = admin_username.strip() if admin_username else ""
+
         # Check username match
         if username != admin_username:
             return False
 
         # Mode A: bcrypt hash (preferred, more secure)
         if admin_password_hash:
+            # Note: bcrypt hash comparison doesn't need strip as hash won't have whitespace
             return verify_password(password, admin_password_hash)
 
         # Mode B: plaintext password (fallback for dev/testing)
         elif admin_password_plain:
+            admin_password_plain = admin_password_plain.strip() if admin_password_plain else ""
             return password == admin_password_plain
 
         # No password configured

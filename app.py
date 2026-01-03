@@ -378,17 +378,24 @@ def show_auth_page():
         st.caption("For system administrators only.")
 
         # Debug info: show which secrets are configured (without revealing values)
-        try:
-            has_username = "ADMIN_USERNAME" in st.secrets
-            has_password_hash = "ADMIN_PASSWORD_HASH" in st.secrets
-            has_password_plain = "ADMIN_PASSWORD" in st.secrets
+        with st.expander("🔧 Debug: Secrets Configuration", expanded=False):
+            try:
+                # Show all secret keys (safe - no values)
+                secret_keys = list(st.secrets.keys())
+                st.write("**Available secret keys:**")
+                st.code(secret_keys)
 
-            st.info(f"🔧 **Secrets Status:**\n\n"
-                   f"- ADMIN_USERNAME: `{has_username}`\n"
-                   f"- ADMIN_PASSWORD_HASH: `{has_password_hash}`\n"
-                   f"- ADMIN_PASSWORD: `{has_password_plain}`")
-        except Exception:
-            st.warning("⚠️ Unable to read secrets configuration.")
+                # Show specific admin secret presence
+                has_username = "ADMIN_USERNAME" in st.secrets
+                has_password_hash = "ADMIN_PASSWORD_HASH" in st.secrets
+                has_password_plain = "ADMIN_PASSWORD" in st.secrets
+
+                st.write("**Admin secret status:**")
+                st.write(f"- ADMIN_USERNAME: `{has_username}`")
+                st.write(f"- ADMIN_PASSWORD_HASH: `{has_password_hash}`")
+                st.write(f"- ADMIN_PASSWORD: `{has_password_plain}`")
+            except Exception as e:
+                st.error(f"⚠️ Unable to read secrets: {e}")
 
         with st.form("admin_form"):
             admin_username = st.text_input("Admin Username", key="admin_username_input")
