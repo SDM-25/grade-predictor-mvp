@@ -163,9 +163,9 @@ if "session_length" not in st.session_state:
     st.session_state.session_length = 60
 
 # ============ AUTO-LOGIN WITH PERSISTENT TOKEN ============
-# Initialize cookie manager
+# Initialize cookie manager (explicit key prevents DuplicateElementKey if re-imported)
 if HAS_COOKIE_MANAGER:
-    cookie_manager = stx.CookieManager()
+    cookie_manager = stx.CookieManager(key="auth_cookie_manager")
 
     # Try auto-login only if not already logged in
     if st.session_state.user_id is None:
