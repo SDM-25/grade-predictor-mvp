@@ -28,6 +28,14 @@ try:
 except ImportError:
     HAS_PYMUPDF = False
 
+# Import dashboard helpers
+from dashboard_helpers import (
+    get_all_courses, get_all_upcoming_assessments,
+    get_course_topic_count, get_course_assessment_count,
+    compute_course_snapshot, generate_recommended_tasks,
+    get_at_risk_courses
+)
+
 def compute_mastery(topic_id: int, today: date, is_retake: bool = False) -> tuple:
     """
     Compute mastery (0-5) based on:
@@ -873,454 +881,644 @@ tabs = st.tabs(["📊 Dashboard", "📋 Assessments", "📅 Exams", "📖 Topics
 # ============ DASHBOARD ============
 with tabs[0]:
     today = date.today()
-    
-    # Get course total marks from assessments
-    course_total_marks = get_course_total_marks(user_id, course_id)
-    if course_total_marks == 0:
-        ensure_default_assessment(user_id, course_id)
-        course_total_marks = get_course_total_marks(user_id, course_id)
-    
-    # Get next due date from assessments (primary source)
-    next_due, next_assessment_name, next_is_timed = get_next_due_date(user_id, course_id, today)
-    
-    # Fallback to exams table for backward compatibility
-    exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date", 
-                        (user_id, course_id))
-    
-    # Determine tracking date and retake status
-    if next_due:
-        # Use assessment due date
-        tracking_date = next_due
-        days_left = max((tracking_date - today).days, 0)
-        is_retake = not next_is_timed  # Non-timed assessments treated like retakes (no lecture requirement)
-        st.caption(f"📅 Tracking: **{next_assessment_name}** (due {tracking_date.strftime('%d/%m/%Y')})")
-    elif not exams_df.empty:
-        # Fallback to exam date
-        exam_options = exams_df.apply(lambda r: f"{r['exam_name']} ({r['exam_date']}){' 🔄 RETAKE' if r.get('is_retake', 0) == 1 else ''}", axis=1).tolist()
-        selected_exam_idx = st.selectbox("Select exam to track", range(len(exam_options)), format_func=lambda i: exam_options[i])
-        exam_row = exams_df.iloc[selected_exam_idx]
-        tracking_date = pd.to_datetime(exam_row["exam_date"]).date()
-        days_left = max((tracking_date - today).days, 0)
-        is_retake = bool(exam_row.get("is_retake", 0))
-    else:
-        st.warning("⚠️ No assessments with due dates. Go to Assessments tab to add one.")
-        tracking_date = None
-        days_left = 30  # Default for calculations
-        is_retake = False
-    
-    if is_retake:
-        st.info("🔄 **Non-timed assessment** — Lectures not included in readiness calculations.")
-    
-    topics_df = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id", 
-                         (user_id, course_id))
-    upcoming_lectures = read_sql("""
-        SELECT * FROM scheduled_lectures 
-        WHERE user_id=? AND course_id=? AND lecture_date >= ? 
-        ORDER BY lecture_date LIMIT 10
-    """, (user_id, course_id, str(today)))
-    
-    # Get timed attempts data for dashboard display
-    timed_attempts_df = read_sql("""
-        SELECT * FROM timed_attempts 
-        WHERE user_id=? AND course_id=? 
-        ORDER BY attempt_date DESC
-    """, (user_id, course_id))
-    
-    # Timed attempts stats
-    recent_timed = timed_attempts_df[
-        pd.to_datetime(timed_attempts_df["attempt_date"]).dt.date >= (today - timedelta(days=14))
-    ] if not timed_attempts_df.empty else pd.DataFrame()
-    latest_timed_score = timed_attempts_df.iloc[0]["score_pct"] * 100 if not timed_attempts_df.empty else None
-    timed_count_14d = len(recent_timed)
-    
-    if topics_df.empty:
-        st.info("📖 No topics added yet. Go to Topics tab to add some.")
-    else:
-        mastery_data = []
-        for _, row in topics_df.iterrows():
-            m, last_act, ex_cnt, st_cnt, lec_cnt, timed_sig, timed_cnt = compute_mastery(int(row["id"]), today, is_retake)
-            mastery_data.append({
-                "id": row["id"],
-                "topic_name": row["topic_name"],
-                "weight_points": row["weight_points"],
-                "mastery": round(m, 2),
-                "last_activity": last_act,
-                "exercises": ex_cnt,
-                "study_sessions": st_cnt,
-                "lectures": lec_cnt if not is_retake else 0,
-                "timed_signal": timed_sig,
-                "timed_count": timed_cnt
-            })
-        
-        topics_with_mastery = pd.DataFrame(mastery_data)
-        topics_scored, expected_sum, weight_sum, coverage_pct, mastery_pct, retention_pct = compute_readiness(topics_with_mastery, today)
-        
-        # Auto-calculate practice blend based on exam proximity and lecture progress
-        # Early in course: low blend (value mastery/study more)
-        # Near exam: high blend (value practice exams more)
-        
-        # Time-based component (0.1 to 0.6 based on days left)
-        if days_left >= 60:
-            time_blend = 0.1
-        elif days_left >= 30:
-            time_blend = 0.1 + (60 - days_left) / 30 * 0.15  # 0.1 to 0.25
-        elif days_left >= 14:
-            time_blend = 0.25 + (30 - days_left) / 16 * 0.15  # 0.25 to 0.4
-        elif days_left >= 7:
-            time_blend = 0.4 + (14 - days_left) / 7 * 0.1  # 0.4 to 0.5
-        elif days_left >= 0:
-            time_blend = 0.5 + (7 - days_left) / 7 * 0.1  # 0.5 to 0.6
-        else:
-            time_blend = 0.6
-        
-        # Lecture progress component (adds up to 0.2 based on % of scheduled lectures attended)
-        lecture_blend = 0.0
-        if not is_retake:
-            all_lectures = read_sql("""
-                SELECT COUNT(*) as total, SUM(CASE WHEN attended=1 THEN 1 ELSE 0 END) as attended
-                FROM scheduled_lectures 
-                WHERE user_id=? AND course_id=?
-            """, (user_id, course_id))
-            if not all_lectures.empty:
-                total_lec = int(all_lectures.iloc[0]["total"] or 0)
-                attended_lec = int(all_lectures.iloc[0]["attended"] or 0)
-                if total_lec > 0:
-                    lecture_progress = attended_lec / total_lec
-                    lecture_blend = lecture_progress * 0.2  # Up to +0.2
-        
-        # Combine: cap at 0.7 (never fully ignore mastery)
-        practice_blend = min(time_blend + lecture_blend, 0.7)
-        
-        # Apply per-topic blending if there are timed signals
-        has_timed_signals = "timed_signal" in topics_scored.columns and topics_scored["timed_signal"].sum() > 0
-        if practice_blend > 0 and has_timed_signals:
-            blended_readiness = []
-            for _, row in topics_scored.iterrows():
-                base_readiness = row["readiness"]
-                timed_sig = row.get("timed_signal", 0.0) or 0.0
-                if timed_sig > 0:
-                    # Blend: (1-blend)*readiness + blend*timed_signal
-                    blended = (1 - practice_blend) * base_readiness + practice_blend * timed_sig
-                else:
-                    blended = base_readiness
-                blended_readiness.append(blended)
-            topics_scored["blended_readiness"] = blended_readiness
-            topics_scored["expected_points"] = topics_scored["weight_points"] * topics_scored["blended_readiness"]
-            expected_sum = topics_scored["expected_points"].sum()
-            retention_pct = (topics_scored["weight_points"] * topics_scored["blended_readiness"]).sum() / weight_sum if weight_sum > 0 else 0
 
-        base_pred = expected_sum
-        if weight_sum and abs(weight_sum - float(total_marks)) > 1e-6:
-            base_pred *= float(total_marks) / float(weight_sum)
-        pred_marks = base_pred
-        
-        # ============ INCORPORATE ACTUAL MARKS ============
-        # Get actual marks from completed assessments and exams
-        completed_assessments = read_sql("""
-            SELECT marks, actual_marks FROM assessments 
-            WHERE user_id=? AND course_id=? AND actual_marks IS NOT NULL
-        """, (user_id, course_id))
-        
-        completed_exams = read_sql("""
-            SELECT marks, actual_marks FROM exams 
-            WHERE user_id=? AND course_id=? AND actual_marks IS NOT NULL
-        """, (user_id, course_id))
-        
-        # Calculate actual marks earned
-        actual_marks_earned = 0
-        actual_marks_possible = 0
-        
-        if not completed_assessments.empty:
-            actual_marks_earned += completed_assessments["actual_marks"].sum()
-            actual_marks_possible += completed_assessments["marks"].sum()
-        
-        if not completed_exams.empty:
-            actual_marks_earned += completed_exams["actual_marks"].sum()
-            actual_marks_possible += completed_exams["marks"].sum()
-        
-        # Calculate remaining marks to predict
-        remaining_marks = total_marks - actual_marks_possible
-        
-        if actual_marks_possible > 0 and remaining_marks > 0:
-            # Blend actual results with predictions for remaining assessments
-            # pred_marks is based on total_marks, so we need to scale it for remaining only
-            predicted_remaining = (pred_marks / total_marks) * remaining_marks if total_marks > 0 else 0
-            combined_pred = actual_marks_earned + predicted_remaining
-            pred_marks = combined_pred
-            
-            # Show breakdown
-            actual_pct = (actual_marks_earned / actual_marks_possible * 100) if actual_marks_possible > 0 else 0
-            st.info(f"📊 **Grade Breakdown**: Actual: {int(actual_marks_earned)}/{int(actual_marks_possible)} ({actual_pct:.0f}%) + Predicted: {predicted_remaining:.1f}/{remaining_marks}")
-        elif actual_marks_possible > 0 and remaining_marks == 0:
-            # All assessments completed
-            pred_marks = actual_marks_earned
-            actual_pct = (actual_marks_earned / total_marks * 100) if total_marks > 0 else 0
-            st.success(f"✅ **All assessments completed!** Final grade: {int(actual_marks_earned)}/{total_marks} ({actual_pct:.0f}%)")
+    # ============ VIEW TOGGLE (GLOBAL vs COURSE) ============
+    st.subheader("📊 Dashboard")
 
-        # Show prediction mode indicator
-        if has_timed_signals:
-            blend_pct = int(practice_blend * 100)
-            if blend_pct < 25:
-                blend_desc = "📚 **Study Focus** — Predictions weighted toward mastery & review"
-            elif blend_pct < 50:
-                blend_desc = "⚖️ **Balanced** — Mixing mastery with practice performance"
-            else:
-                blend_desc = "🎯 **Practice Focus** — Predictions weighted toward timed attempts"
-            st.caption(f"{blend_desc} (Practice weight: {blend_pct}%)")
-        
-        st.divider()
-        
-        # Main metrics row
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Predicted", f"{pred_marks:.1f} / {total_marks}", delta=f"Target: {target_marks}")
-        c2.metric("Readiness", f"{retention_pct*100:.0f}%")
-        c3.metric("Days left", f"{days_left}" if tracking_date else "N/A")
-        c4.metric("Coverage", f"{coverage_pct*100:.0f}%")
-        
-        # Timed attempts metric
-        if latest_timed_score is not None:
-            c5.metric("Last Practice", f"{latest_timed_score:.0f}%", delta=f"{timed_count_14d} in 14d")
+    view_col1, view_col2 = st.columns([2, 1])
+    with view_col1:
+        dashboard_view = st.radio(
+            "View:",
+            options=["🌍 Global (All Courses)", f"📚 Course ({selected_course})"],
+            horizontal=True,
+            key="dashboard_view"
+        )
+
+    is_global_view = "Global" in dashboard_view
+
+    st.divider()
+
+    # ============ GLOBAL VIEW ============
+    if is_global_view:
+        st.markdown("### 🌍 All Courses Overview")
+
+        # Get all courses
+        all_courses = get_all_courses(user_id)
+
+        if all_courses.empty:
+            st.info("📚 No courses yet. Select a course from the sidebar to get started.")
         else:
-            c5.metric("Last Practice", "—", delta="No attempts yet")
-        
-        if pred_marks < target_marks - 10:
-            status = "🔴 AT RISK"
-        elif pred_marks < target_marks:
-            status = "🟡 BORDERLINE"
-        else:
-            status = "🟢 ON TRACK"
-        st.write(f"**Status:** {status}")
-        
-        # ============ PER-ASSESSMENT BREAKDOWN ============
-        st.subheader("📊 Assessment Breakdown")
-        
-        all_assessments = read_sql("""
-            SELECT id, assessment_name, assessment_type, marks, actual_marks, progress_pct, due_date, is_timed
-            FROM assessments WHERE user_id=? AND course_id=? ORDER BY due_date, id
-        """, (user_id, course_id))
-        
-        if not all_assessments.empty:
-            # Calculate predicted marks per assessment
-            avg_readiness = retention_pct if weight_sum > 0 else 0.5
-            
-            breakdown_data = []
-            for _, asmt in all_assessments.iterrows():
-                asmt_marks = asmt["marks"]
-                actual = asmt["actual_marks"]
-                progress = asmt["progress_pct"] or 0
-                is_timed = asmt["is_timed"] == 1
-                
-                if pd.notna(actual):
-                    # Already completed
-                    predicted = actual
-                    status_icon = "✅"
-                    status_text = f"Completed: {int(actual)}/{asmt_marks}"
-                elif is_timed:
-                    # Exam - use readiness
-                    predicted = asmt_marks * avg_readiness
-                    status_icon = "📝"
-                    pct = int(avg_readiness * 100)
-                    status_text = f"Predicted: {predicted:.0f}/{asmt_marks} ({pct}%)"
-                else:
-                    # Assignment - use progress + readiness blend
-                    if progress >= 100:
-                        predicted = asmt_marks * avg_readiness
-                        status_icon = "📤"
-                        status_text = f"Ready to submit: ~{predicted:.0f}/{asmt_marks}"
+            # ============ SECTION 1: UPCOMING ASSESSMENTS ============
+            st.subheader("📅 Upcoming Assessments (Next 30 Days)")
+
+            upcoming_assessments = get_all_upcoming_assessments(user_id, days_ahead=30)
+
+            if not upcoming_assessments.empty:
+                # Format the table
+                assessment_display = []
+                for _, asmt in upcoming_assessments.iterrows():
+                    due_date = pd.to_datetime(asmt['due_date']).date()
+                    days_until = (due_date - today).days
+
+                    if days_until <= 3:
+                        urgency = "🔴"
+                    elif days_until <= 7:
+                        urgency = "🟡"
                     else:
-                        # Partial progress - scale prediction
-                        progress_factor = progress / 100
-                        predicted = asmt_marks * (0.5 + 0.5 * progress_factor) * avg_readiness
-                        status_icon = "🔄"
-                        status_text = f"In progress ({progress}%): ~{predicted:.0f}/{asmt_marks}"
-                
-                breakdown_data.append({
-                    "": status_icon,
-                    "Assessment": asmt["assessment_name"],
-                    "Type": asmt["assessment_type"],
-                    "Marks": f"{int(asmt_marks)}",
-                    "Status": status_text
+                        urgency = "🟢"
+
+                    assessment_display.append({
+                        "": urgency,
+                        "Course": asmt['course_name'],
+                        "Assessment": asmt['assessment_name'],
+                        "Type": asmt['assessment_type'],
+                        "Marks": int(asmt['marks']),
+                        "Due Date": due_date.strftime("%a %d/%m/%Y"),
+                        "Days Left": days_until
+                    })
+
+                assessment_df = pd.DataFrame(assessment_display)
+                st.dataframe(assessment_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("✅ No upcoming assessments in the next 30 days.")
+
+            st.divider()
+
+            # ============ SECTION 2: RECOMMENDED ACTIONS ============
+            st.subheader("💡 Recommended Actions (Top 10)")
+
+            recommended_tasks = generate_recommended_tasks(user_id, course_id=None, max_tasks=10)
+
+            if recommended_tasks:
+                # Display tasks as cards
+                for i, task in enumerate(recommended_tasks[:10]):
+                    task_type_icons = {
+                        'assessment_due': '📝',
+                        'timed_attempt': '⏱️',
+                        'review_topic': '📖',
+                        'do_exercises': '🏋️',
+                        'setup_missing': '⚙️'
+                    }
+
+                    icon = task_type_icons.get(task['task_type'], '📌')
+                    course_tag = f"**{task['course_name']}**"
+                    time_info = f" · ~{task['est_minutes']}min" if task.get('est_minutes') else ""
+
+                    st.markdown(f"{i+1}. {icon} {task['title']} ({course_tag}){time_info}")
+                    st.caption(f"   ↳ {task['detail']}")
+            else:
+                st.info("🎉 All caught up! No urgent actions needed.")
+
+            st.divider()
+
+            # ============ SECTION 3: AT-RISK COURSES ============
+            st.subheader("⚠️ At-Risk Courses")
+
+            at_risk = get_at_risk_courses(user_id, readiness_threshold=0.6, days_threshold=21)
+
+            if at_risk:
+                risk_data = []
+                for course_snapshot in at_risk:
+                    status_icons = {
+                        'at_risk': '🔴',
+                        'borderline': '🟡',
+                        'on_track': '🟢'
+                    }
+
+                    risk_data.append({
+                        "": status_icons.get(course_snapshot['status'], '⚪'),
+                        "Course": course_snapshot['course_name'],
+                        "Readiness": f"{course_snapshot['readiness_pct']:.0f}%",
+                        "Predicted": f"{course_snapshot['predicted_marks']:.0f}/{course_snapshot['total_marks']}",
+                        "Days Left": course_snapshot['days_left'] if course_snapshot['days_left'] else "—",
+                        "Next Due": course_snapshot['next_assessment_name'] or "—"
+                    })
+
+                risk_df = pd.DataFrame(risk_data)
+                st.dataframe(risk_df, use_container_width=True, hide_index=True)
+
+                st.caption("💡 **Tip**: Switch to Course view to see detailed recommendations for each course.")
+            else:
+                st.success("✅ All courses are on track! Keep up the great work.")
+
+            st.divider()
+
+            # ============ SECTION 4: QUICK COURSE SUMMARY ============
+            st.subheader("📊 All Courses Summary")
+
+            course_summaries = []
+            for _, course in all_courses.iterrows():
+                cid = int(course['id'])
+                cname = course['course_name']
+
+                has_topics = get_course_topic_count(user_id, cid) > 0
+                has_assessments = get_course_assessment_count(user_id, cid) > 0
+
+                if has_topics:
+                    # Compute snapshot
+                    snapshot = compute_course_snapshot(user_id, cid)
+                    if snapshot:
+                        status_icons = {
+                            'at_risk': '🔴',
+                            'borderline': '🟡',
+                            'on_track': '🟢'
+                        }
+
+                        course_summaries.append({
+                            "": status_icons.get(snapshot['status'], '⚪'),
+                            "Course": cname,
+                            "Predicted": f"{snapshot['predicted_marks']:.0f}/{snapshot['total_marks']}",
+                            "Target": f"{snapshot['target_marks']}",
+                            "Readiness": f"{snapshot['readiness_pct']:.0f}%",
+                            "Days Left": snapshot['days_left'] if snapshot['days_left'] else "—"
+                        })
+                else:
+                    course_summaries.append({
+                        "": "⚙️",
+                        "Course": cname,
+                        "Predicted": "—",
+                        "Target": "—",
+                        "Readiness": "—",
+                        "Days Left": "Setup needed"
+                    })
+
+            if course_summaries:
+                summary_df = pd.DataFrame(course_summaries)
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    # ============ COURSE VIEW ============
+    else:
+        st.markdown(f"### 📚 {selected_course} — Course Dashboard")
+
+        # Get course total marks from assessments
+        course_total_marks = get_course_total_marks(user_id, course_id)
+        if course_total_marks == 0:
+            ensure_default_assessment(user_id, course_id)
+            course_total_marks = get_course_total_marks(user_id, course_id)
+
+        # Get next due date from assessments (primary source)
+        next_due, next_assessment_name, next_is_timed = get_next_due_date(user_id, course_id, today)
+
+        # Fallback to exams table for backward compatibility
+        exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date",
+                            (user_id, course_id))
+
+        # Determine tracking date and retake status
+        if next_due:
+            # Use assessment due date
+            tracking_date = next_due
+            days_left = max((tracking_date - today).days, 0)
+            is_retake = not next_is_timed  # Non-timed assessments treated like retakes (no lecture requirement)
+            st.caption(f"📅 Tracking: **{next_assessment_name}** (due {tracking_date.strftime('%d/%m/%Y')})")
+        elif not exams_df.empty:
+            # Fallback to exam date
+            exam_options = exams_df.apply(lambda r: f"{r['exam_name']} ({r['exam_date']}){' 🔄 RETAKE' if r.get('is_retake', 0) == 1 else ''}", axis=1).tolist()
+            selected_exam_idx = st.selectbox("Select exam to track", range(len(exam_options)), format_func=lambda i: exam_options[i])
+            exam_row = exams_df.iloc[selected_exam_idx]
+            tracking_date = pd.to_datetime(exam_row["exam_date"]).date()
+            days_left = max((tracking_date - today).days, 0)
+            is_retake = bool(exam_row.get("is_retake", 0))
+        else:
+            # No assessments — show empty state
+            st.warning("⚠️ No assessments with due dates.")
+            st.info("👉 Go to **Assessments** tab to add assessments for this course.")
+            tracking_date = None
+            days_left = 30  # Default for calculations
+            is_retake = False
+
+        if is_retake:
+            st.info("🔄 **Non-timed assessment** — Lectures not included in readiness calculations.")
+
+        topics_df = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id",
+                             (user_id, course_id))
+        upcoming_lectures = read_sql("""
+            SELECT * FROM scheduled_lectures
+            WHERE user_id=? AND course_id=? AND lecture_date >= ?
+            ORDER BY lecture_date LIMIT 10
+        """, (user_id, course_id, str(today)))
+    
+        # Get timed attempts data for dashboard display
+        timed_attempts_df = read_sql("""
+            SELECT * FROM timed_attempts 
+            WHERE user_id=? AND course_id=? 
+            ORDER BY attempt_date DESC
+        """, (user_id, course_id))
+    
+        # Timed attempts stats
+        recent_timed = timed_attempts_df[
+            pd.to_datetime(timed_attempts_df["attempt_date"]).dt.date >= (today - timedelta(days=14))
+        ] if not timed_attempts_df.empty else pd.DataFrame()
+        latest_timed_score = timed_attempts_df.iloc[0]["score_pct"] * 100 if not timed_attempts_df.empty else None
+        timed_count_14d = len(recent_timed)
+    
+        if topics_df.empty:
+            st.info("📖 No topics added yet. Go to Topics tab to add some.")
+        else:
+            mastery_data = []
+            for _, row in topics_df.iterrows():
+                m, last_act, ex_cnt, st_cnt, lec_cnt, timed_sig, timed_cnt = compute_mastery(int(row["id"]), today, is_retake)
+                mastery_data.append({
+                    "id": row["id"],
+                    "topic_name": row["topic_name"],
+                    "weight_points": row["weight_points"],
+                    "mastery": round(m, 2),
+                    "last_activity": last_act,
+                    "exercises": ex_cnt,
+                    "study_sessions": st_cnt,
+                    "lectures": lec_cnt if not is_retake else 0,
+                    "timed_signal": timed_sig,
+                    "timed_count": timed_cnt
                 })
+        
+            topics_with_mastery = pd.DataFrame(mastery_data)
+            topics_scored, expected_sum, weight_sum, coverage_pct, mastery_pct, retention_pct = compute_readiness(topics_with_mastery, today)
+        
+            # Auto-calculate practice blend based on exam proximity and lecture progress
+            # Early in course: low blend (value mastery/study more)
+            # Near exam: high blend (value practice exams more)
+        
+            # Time-based component (0.1 to 0.6 based on days left)
+            if days_left >= 60:
+                time_blend = 0.1
+            elif days_left >= 30:
+                time_blend = 0.1 + (60 - days_left) / 30 * 0.15  # 0.1 to 0.25
+            elif days_left >= 14:
+                time_blend = 0.25 + (30 - days_left) / 16 * 0.15  # 0.25 to 0.4
+            elif days_left >= 7:
+                time_blend = 0.4 + (14 - days_left) / 7 * 0.1  # 0.4 to 0.5
+            elif days_left >= 0:
+                time_blend = 0.5 + (7 - days_left) / 7 * 0.1  # 0.5 to 0.6
+            else:
+                time_blend = 0.6
+        
+            # Lecture progress component (adds up to 0.2 based on % of scheduled lectures attended)
+            lecture_blend = 0.0
+            if not is_retake:
+                all_lectures = read_sql("""
+                    SELECT COUNT(*) as total, SUM(CASE WHEN attended=1 THEN 1 ELSE 0 END) as attended
+                    FROM scheduled_lectures 
+                    WHERE user_id=? AND course_id=?
+                """, (user_id, course_id))
+                if not all_lectures.empty:
+                    total_lec = int(all_lectures.iloc[0]["total"] or 0)
+                    attended_lec = int(all_lectures.iloc[0]["attended"] or 0)
+                    if total_lec > 0:
+                        lecture_progress = attended_lec / total_lec
+                        lecture_blend = lecture_progress * 0.2  # Up to +0.2
+        
+            # Combine: cap at 0.7 (never fully ignore mastery)
+            practice_blend = min(time_blend + lecture_blend, 0.7)
+        
+            # Apply per-topic blending if there are timed signals
+            has_timed_signals = "timed_signal" in topics_scored.columns and topics_scored["timed_signal"].sum() > 0
+            if practice_blend > 0 and has_timed_signals:
+                blended_readiness = []
+                for _, row in topics_scored.iterrows():
+                    base_readiness = row["readiness"]
+                    timed_sig = row.get("timed_signal", 0.0) or 0.0
+                    if timed_sig > 0:
+                        # Blend: (1-blend)*readiness + blend*timed_signal
+                        blended = (1 - practice_blend) * base_readiness + practice_blend * timed_sig
+                    else:
+                        blended = base_readiness
+                    blended_readiness.append(blended)
+                topics_scored["blended_readiness"] = blended_readiness
+                topics_scored["expected_points"] = topics_scored["weight_points"] * topics_scored["blended_readiness"]
+                expected_sum = topics_scored["expected_points"].sum()
+                retention_pct = (topics_scored["weight_points"] * topics_scored["blended_readiness"]).sum() / weight_sum if weight_sum > 0 else 0
+
+            base_pred = expected_sum
+            if weight_sum and abs(weight_sum - float(total_marks)) > 1e-6:
+                base_pred *= float(total_marks) / float(weight_sum)
+            pred_marks = base_pred
+        
+            # ============ INCORPORATE ACTUAL MARKS ============
+            # Get actual marks from completed assessments and exams
+            completed_assessments = read_sql("""
+                SELECT marks, actual_marks FROM assessments 
+                WHERE user_id=? AND course_id=? AND actual_marks IS NOT NULL
+            """, (user_id, course_id))
+        
+            completed_exams = read_sql("""
+                SELECT marks, actual_marks FROM exams 
+                WHERE user_id=? AND course_id=? AND actual_marks IS NOT NULL
+            """, (user_id, course_id))
+        
+            # Calculate actual marks earned
+            actual_marks_earned = 0
+            actual_marks_possible = 0
+        
+            if not completed_assessments.empty:
+                actual_marks_earned += completed_assessments["actual_marks"].sum()
+                actual_marks_possible += completed_assessments["marks"].sum()
+        
+            if not completed_exams.empty:
+                actual_marks_earned += completed_exams["actual_marks"].sum()
+                actual_marks_possible += completed_exams["marks"].sum()
+        
+            # Calculate remaining marks to predict
+            remaining_marks = total_marks - actual_marks_possible
+        
+            if actual_marks_possible > 0 and remaining_marks > 0:
+                # Blend actual results with predictions for remaining assessments
+                # pred_marks is based on total_marks, so we need to scale it for remaining only
+                predicted_remaining = (pred_marks / total_marks) * remaining_marks if total_marks > 0 else 0
+                combined_pred = actual_marks_earned + predicted_remaining
+                pred_marks = combined_pred
             
-            breakdown_df = pd.DataFrame(breakdown_data)
-            st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+                # Show breakdown
+                actual_pct = (actual_marks_earned / actual_marks_possible * 100) if actual_marks_possible > 0 else 0
+                st.info(f"📊 **Grade Breakdown**: Actual: {int(actual_marks_earned)}/{int(actual_marks_possible)} ({actual_pct:.0f}%) + Predicted: {predicted_remaining:.1f}/{remaining_marks}")
+            elif actual_marks_possible > 0 and remaining_marks == 0:
+                # All assessments completed
+                pred_marks = actual_marks_earned
+                actual_pct = (actual_marks_earned / total_marks * 100) if total_marks > 0 else 0
+                st.success(f"✅ **All assessments completed!** Final grade: {int(actual_marks_earned)}/{total_marks} ({actual_pct:.0f}%)")
+
+            # Show prediction mode indicator
+            if has_timed_signals:
+                blend_pct = int(practice_blend * 100)
+                if blend_pct < 25:
+                    blend_desc = "📚 **Study Focus** — Predictions weighted toward mastery & review"
+                elif blend_pct < 50:
+                    blend_desc = "⚖️ **Balanced** — Mixing mastery with practice performance"
+                else:
+                    blend_desc = "🎯 **Practice Focus** — Predictions weighted toward timed attempts"
+                st.caption(f"{blend_desc} (Practice weight: {blend_pct}%)")
         
-        st.subheader("💡 Recommendations")
-        topics_scored["gap_score"] = topics_scored["weight_points"] * (1.0 - topics_scored["readiness"])
-        recs = generate_recommendations(topics_scored, upcoming_lectures, days_left, today, is_retake)
-        for rec in recs:
-            st.markdown(f"- {rec}")
+            st.divider()
         
-        # ============ STUDY PLAN GENERATOR ============
-        st.subheader("📅 7-Day Study Plan")
+            # Main metrics row
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Predicted", f"{pred_marks:.1f} / {total_marks}", delta=f"Target: {target_marks}")
+            c2.metric("Readiness", f"{retention_pct*100:.0f}%")
+            c3.metric("Days left", f"{days_left}" if tracking_date else "N/A")
+            c4.metric("Coverage", f"{coverage_pct*100:.0f}%")
         
-        # Get settings from session state
-        hours_per_week = st.session_state.get("hours_per_week", 10)
-        session_length = st.session_state.get("session_length", 60)
+            # Timed attempts metric
+            if latest_timed_score is not None:
+                c5.metric("Last Practice", f"{latest_timed_score:.0f}%", delta=f"{timed_count_14d} in 14d")
+            else:
+                c5.metric("Last Practice", "—", delta="No attempts yet")
         
-        # Calculate total sessions available
-        total_mins_per_week = hours_per_week * 60
-        num_sessions = max(1, total_mins_per_week // session_length)
+            if pred_marks < target_marks - 10:
+                status = "🔴 AT RISK"
+            elif pred_marks < target_marks:
+                status = "🟡 BORDERLINE"
+            else:
+                status = "🟢 ON TRACK"
+            st.write(f"**Status:** {status}")
         
-        # Determine session types based on days_left
-        timed_sessions = 1 if days_left < 30 else 0
-        mixed_sessions = 2 if days_left < 21 else (1 if days_left < 45 else 0)
-        topic_sessions = max(1, num_sessions - timed_sessions - mixed_sessions)
+            # ============ PER-ASSESSMENT BREAKDOWN ============
+            st.subheader("📊 Assessment Breakdown")
         
-        # Get topics sorted by gap_score
-        gaps_for_plan = topics_scored.sort_values("gap_score", ascending=False).copy()
+            all_assessments = read_sql("""
+                SELECT id, assessment_name, assessment_type, marks, actual_marks, progress_pct, due_date, is_timed
+                FROM assessments WHERE user_id=? AND course_id=? ORDER BY due_date, id
+            """, (user_id, course_id))
         
-        if not gaps_for_plan.empty and gaps_for_plan["gap_score"].sum() > 0:
-            # Normalize gap_scores to allocate sessions proportionally
-            gaps_for_plan["session_share"] = gaps_for_plan["gap_score"] / gaps_for_plan["gap_score"].sum()
-            gaps_for_plan["allocated_sessions"] = (gaps_for_plan["session_share"] * topic_sessions).round().astype(int)
+            if not all_assessments.empty:
+                # Calculate predicted marks per assessment
+                avg_readiness = retention_pct if weight_sum > 0 else 0.5
             
-            # Ensure at least 1 session for top gaps, redistribute if needed
-            if gaps_for_plan["allocated_sessions"].sum() < topic_sessions:
-                # Add remaining to top gap topics
-                remaining = topic_sessions - gaps_for_plan["allocated_sessions"].sum()
-                for i in range(int(remaining)):
-                    idx = i % len(gaps_for_plan)
-                    gaps_for_plan.iloc[idx, gaps_for_plan.columns.get_loc("allocated_sessions")] += 1
+                breakdown_data = []
+                for _, asmt in all_assessments.iterrows():
+                    asmt_marks = asmt["marks"]
+                    actual = asmt["actual_marks"]
+                    progress = asmt["progress_pct"] or 0
+                    is_timed = asmt["is_timed"] == 1
+        
+                    if pd.notna(actual):
+                        # Already completed
+                        predicted = actual
+                        status_icon = "✅"
+                        status_text = f"Completed: {int(actual)}/{asmt_marks}"
+                    elif is_timed:
+                        # Exam - use readiness
+                        predicted = asmt_marks * avg_readiness
+                        status_icon = "📝"
+                        pct = int(avg_readiness * 100)
+                        status_text = f"Predicted: {predicted:.0f}/{asmt_marks} ({pct}%)"
+                    else:
+                        # Assignment - use progress + readiness blend
+                        if progress >= 100:
+                            predicted = asmt_marks * avg_readiness
+                            status_icon = "📤"
+                            status_text = f"Ready to submit: ~{predicted:.0f}/{asmt_marks}"
+                        else:
+                            # Partial progress - scale prediction
+                            progress_factor = progress / 100
+                            predicted = asmt_marks * (0.5 + 0.5 * progress_factor) * avg_readiness
+                            status_icon = "🔄"
+                            status_text = f"In progress ({progress}%): ~{predicted:.0f}/{asmt_marks}"
+        
+                    breakdown_data.append({
+                        "": status_icon,
+                        "Assessment": asmt["assessment_name"],
+                        "Type": asmt["assessment_type"],
+                        "Marks": f"{int(asmt_marks)}",
+                        "Status": status_text
+                    })
             
-            # Build the plan
-            plan = []
-            day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            session_idx = 0
+                breakdown_df = pd.DataFrame(breakdown_data)
+                st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+        
+            st.subheader("💡 Recommended Actions (Next 5)")
+
+            # Generate recommended tasks for this course
+            topics_scored["gap_score"] = topics_scored["weight_points"] * (1.0 - topics_scored["readiness"])
+            course_tasks = generate_recommended_tasks(user_id, course_id=course_id, max_tasks=5)
+
+            if course_tasks:
+                task_type_icons = {
+                    'assessment_due': '📝',
+                    'timed_attempt': '⏱️',
+                    'review_topic': '📖',
+                    'do_exercises': '🏋️',
+                    'setup_missing': '⚙️'
+                }
+
+                for i, task in enumerate(course_tasks):
+                    icon = task_type_icons.get(task['task_type'], '📌')
+                    time_info = f" · ~{task['est_minutes']}min" if task.get('est_minutes') else ""
+                    st.markdown(f"{i+1}. {icon} **{task['title']}**{time_info}")
+                    st.caption(f"   ↳ {task['detail']}")
+            else:
+                # Fallback to old recommendations if task generator returns nothing
+                recs = generate_recommendations(topics_scored, upcoming_lectures, days_left, today, is_retake)
+                for rec in recs:
+                    st.markdown(f"- {rec}")
+        
+            # ============ STUDY PLAN GENERATOR ============
+            st.subheader("📅 7-Day Study Plan")
+        
+            # Get settings from session state
+            hours_per_week = st.session_state.get("hours_per_week", 10)
+            session_length = st.session_state.get("session_length", 60)
+        
+            # Calculate total sessions available
+            total_mins_per_week = hours_per_week * 60
+            num_sessions = max(1, total_mins_per_week // session_length)
+        
+            # Determine session types based on days_left
+            timed_sessions = 1 if days_left < 30 else 0
+            mixed_sessions = 2 if days_left < 21 else (1 if days_left < 45 else 0)
+            topic_sessions = max(1, num_sessions - timed_sessions - mixed_sessions)
+        
+            # Get topics sorted by gap_score
+            gaps_for_plan = topics_scored.sort_values("gap_score", ascending=False).copy()
+        
+            if not gaps_for_plan.empty and gaps_for_plan["gap_score"].sum() > 0:
+                # Normalize gap_scores to allocate sessions proportionally
+                gaps_for_plan["session_share"] = gaps_for_plan["gap_score"] / gaps_for_plan["gap_score"].sum()
+                gaps_for_plan["allocated_sessions"] = (gaps_for_plan["session_share"] * topic_sessions).round().astype(int)
             
-            # Distribute topic review sessions
-            for _, row in gaps_for_plan.iterrows():
-                topic_name = row["topic_name"]
-                mastery = row["mastery"]
-                sessions_for_topic = int(row["allocated_sessions"])
-                
-                for _ in range(sessions_for_topic):
+                # Ensure at least 1 session for top gaps, redistribute if needed
+                if gaps_for_plan["allocated_sessions"].sum() < topic_sessions:
+                    # Add remaining to top gap topics
+                    remaining = topic_sessions - gaps_for_plan["allocated_sessions"].sum()
+                    for i in range(int(remaining)):
+                        idx = i % len(gaps_for_plan)
+                        gaps_for_plan.iloc[idx, gaps_for_plan.columns.get_loc("allocated_sessions")] += 1
+            
+                # Build the plan
+                plan = []
+                day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                session_idx = 0
+            
+                # Distribute topic review sessions
+                for _, row in gaps_for_plan.iterrows():
+                    topic_name = row["topic_name"]
+                    mastery = row["mastery"]
+                    sessions_for_topic = int(row["allocated_sessions"])
+        
+                    for _ in range(sessions_for_topic):
+                        if session_idx >= num_sessions:
+                            break
+                        day = day_names[session_idx % 7]
+                        # Determine session type based on mastery
+                        if mastery < 2:
+                            session_type = "📖 Review"
+                        elif mastery < 4:
+                            session_type = "✏️ Exercises"
+                        else:
+                            session_type = "🔄 Refresh"
+            
+                        plan.append({
+                            "Day": day,
+                            "Topic": topic_name,
+                            "Type": session_type,
+                            "Duration": f"{session_length} mins"
+                        })
+                        session_idx += 1
+            
+                # Add mixed practice sessions
+                for i in range(mixed_sessions):
                     if session_idx >= num_sessions:
                         break
                     day = day_names[session_idx % 7]
-                    # Determine session type based on mastery
-                    if mastery < 2:
-                        session_type = "📖 Review"
-                    elif mastery < 4:
-                        session_type = "✏️ Exercises"
-                    else:
-                        session_type = "🔄 Refresh"
-                    
+                    top_3_topics = ", ".join(gaps_for_plan.head(3)["topic_name"].tolist())
                     plan.append({
                         "Day": day,
-                        "Topic": topic_name,
-                        "Type": session_type,
+                        "Topic": f"Mixed: {top_3_topics}",
+                        "Type": "🎯 Mixed Practice",
                         "Duration": f"{session_length} mins"
                     })
                     session_idx += 1
             
-            # Add mixed practice sessions
-            for i in range(mixed_sessions):
-                if session_idx >= num_sessions:
-                    break
-                day = day_names[session_idx % 7]
-                top_3_topics = ", ".join(gaps_for_plan.head(3)["topic_name"].tolist())
-                plan.append({
-                    "Day": day,
-                    "Topic": f"Mixed: {top_3_topics}",
-                    "Type": "🎯 Mixed Practice",
-                    "Duration": f"{session_length} mins"
-                })
-                session_idx += 1
+                # Add timed attempt sessions
+                for i in range(timed_sessions):
+                    if session_idx >= num_sessions:
+                        break
+                    day = day_names[session_idx % 7]
+                    plan.append({
+                        "Day": day,
+                        "Topic": "Full Paper / Past Exam",
+                        "Type": "⏱️ Timed Attempt",
+                        "Duration": f"{session_length * 2} mins"  # Timed attempts are longer
+                    })
+                    session_idx += 1
             
-            # Add timed attempt sessions
-            for i in range(timed_sessions):
-                if session_idx >= num_sessions:
-                    break
-                day = day_names[session_idx % 7]
-                plan.append({
-                    "Day": day,
-                    "Topic": "Full Paper / Past Exam",
-                    "Type": "⏱️ Timed Attempt",
-                    "Duration": f"{session_length * 2} mins"  # Timed attempts are longer
-                })
-                session_idx += 1
-            
-            # Sort by day order
-            day_order = {d: i for i, d in enumerate(day_names)}
-            plan_df = pd.DataFrame(plan)
-            if not plan_df.empty:
-                plan_df["day_order"] = plan_df["Day"].map(day_order)
-                plan_df = plan_df.sort_values("day_order").drop("day_order", axis=1).reset_index(drop=True)
-                
-                # Display the plan
-                st.dataframe(
-                    plan_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Day": st.column_config.TextColumn("📆 Day"),
-                        "Topic": st.column_config.TextColumn("📚 Topic"),
-                        "Type": st.column_config.TextColumn("🎯 Session Type"),
-                        "Duration": st.column_config.TextColumn("⏱️ Duration"),
-                    }
-                )
-                
-                # Plan summary
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.caption(f"📊 **{len(plan_df)} sessions** this week")
-                with col2:
-                    total_study_time = sum([int(d.split()[0]) for d in plan_df["Duration"]])
-                    st.caption(f"⏱️ **{total_study_time // 60}h {total_study_time % 60}m** total")
-                with col3:
-                    st.caption(f"🎯 Prioritizing: **{gaps_for_plan.iloc[0]['topic_name']}**")
-                
-                # Export button
-                csv_data = plan_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "📥 Export Plan as CSV",
-                    csv_data,
-                    f"study_plan_{selected_course.replace(' ', '_')}.csv",
-                    "text/csv",
-                    key="download_study_plan"
-                )
-        else:
-            st.info("Add topics with weights to generate a study plan.")
+                # Sort by day order
+                day_order = {d: i for i, d in enumerate(day_names)}
+                plan_df = pd.DataFrame(plan)
+                if not plan_df.empty:
+                    plan_df["day_order"] = plan_df["Day"].map(day_order)
+                    plan_df = plan_df.sort_values("day_order").drop("day_order", axis=1).reset_index(drop=True)
         
-        st.subheader("🎯 Top Gaps")
-        gaps = topics_scored.sort_values("gap_score", ascending=False).head(6)
-        st.dataframe(
-            gaps[["topic_name", "weight_points", "mastery", "exercises", "study_sessions", "readiness", "gap_score"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
-                "readiness": st.column_config.ProgressColumn("Readiness", format="%.0f%%", min_value=0, max_value=1),
-            }
-        )
+                    # Display the plan
+                    st.dataframe(
+                        plan_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Day": st.column_config.TextColumn("📆 Day"),
+                            "Topic": st.column_config.TextColumn("📚 Topic"),
+                            "Type": st.column_config.TextColumn("🎯 Session Type"),
+                            "Duration": st.column_config.TextColumn("⏱️ Duration"),
+                        }
+                    )
         
-        if not is_retake and not upcoming_lectures.empty:
-            st.subheader("📅 Upcoming Lectures")
-            upcoming_lectures["lecture_date"] = pd.to_datetime(upcoming_lectures["lecture_date"])
+                    # Plan summary
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.caption(f"📊 **{len(plan_df)} sessions** this week")
+                    with col2:
+                        total_study_time = sum([int(d.split()[0]) for d in plan_df["Duration"]])
+                        st.caption(f"⏱️ **{total_study_time // 60}h {total_study_time % 60}m** total")
+                    with col3:
+                        st.caption(f"🎯 Prioritizing: **{gaps_for_plan.iloc[0]['topic_name']}**")
+        
+                    # Export button
+                    csv_data = plan_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "📥 Export Plan as CSV",
+                        csv_data,
+                        f"study_plan_{selected_course.replace(' ', '_')}.csv",
+                        "text/csv",
+                        key="download_study_plan"
+                    )
+            else:
+                st.info("Add topics with weights to generate a study plan.")
+        
+            st.subheader("🎯 Top Gaps")
+            gaps = topics_scored.sort_values("gap_score", ascending=False).head(6)
             st.dataframe(
-                upcoming_lectures[["lecture_date", "lecture_time", "topics_planned"]].head(5),
+                gaps[["topic_name", "weight_points", "mastery", "exercises", "study_sessions", "readiness", "gap_score"]],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "lecture_date": st.column_config.DateColumn("Date", format="ddd DD/MM"),
+                    "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
+                    "readiness": st.column_config.ProgressColumn("Readiness", format="%.0f%%", min_value=0, max_value=1),
                 }
             )
         
-        st.subheader("📋 All Topics")
-        if is_retake:
-            topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "readiness"]
-        else:
-            topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "lectures", "readiness"]
-        st.dataframe(
-            topics_scored[topics_display_cols],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
-                "readiness": st.column_config.ProgressColumn("Readiness", format="%.0f%%", min_value=0, max_value=1),
-            }
-        )
+            if not is_retake and not upcoming_lectures.empty:
+                st.subheader("📅 Upcoming Lectures")
+                upcoming_lectures["lecture_date"] = pd.to_datetime(upcoming_lectures["lecture_date"])
+                st.dataframe(
+                    upcoming_lectures[["lecture_date", "lecture_time", "topics_planned"]].head(5),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "lecture_date": st.column_config.DateColumn("Date", format="ddd DD/MM"),
+                    }
+                )
+        
+            st.subheader("📋 All Topics")
+            if is_retake:
+                topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "readiness"]
+            else:
+                topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "lectures", "readiness"]
+            st.dataframe(
+                topics_scored[topics_display_cols],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
+                    "readiness": st.column_config.ProgressColumn("Readiness", format="%.0f%%", min_value=0, max_value=1),
+                }
+            )
 
 # ============ ASSESSMENTS TAB ============
 with tabs[1]:
