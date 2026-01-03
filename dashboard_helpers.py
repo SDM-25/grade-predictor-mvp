@@ -124,7 +124,7 @@ def compute_course_snapshot(
     # Calculate readiness and predicted marks
     if retention_pct is None and has_topics:
         # Compute it if not provided
-        from app import compute_readiness
+        from metrics import compute_readiness
         if topics_with_mastery is not None:
             _, _, _, _, _, retention_pct = compute_readiness(topics_with_mastery, today)
         else:
@@ -279,7 +279,7 @@ def generate_recommended_tasks(
 
         if not topics_df.empty:
             # Import compute_mastery and compute_readiness
-            from app import compute_mastery, compute_readiness
+            from metrics import compute_mastery, compute_readiness
 
             # Calculate mastery and readiness for each topic
             mastery_data = []
@@ -401,7 +401,7 @@ def get_at_risk_courses(user_id: int, readiness_threshold: float = 0.6, days_thr
         if topics_df.empty:
             continue
 
-        from app import compute_mastery, compute_readiness
+        from metrics import compute_mastery, compute_readiness
 
         mastery_data = []
         for _, row in topics_df.iterrows():
