@@ -11,6 +11,8 @@ from db import (
     get_course_total_marks, get_next_due_date, ensure_default_assessment, get_assessments,
     # Auth functions
     hash_password, verify_password, create_user, get_user_by_email, update_last_login,
+    # Auth tokens (persistent login)
+    generate_token, hash_token, store_token, validate_token, revoke_token, cleanup_expired_tokens,
     # Session tracking
     upsert_session, end_session, get_live_users_count,
     # Legacy data functions
@@ -21,6 +23,13 @@ from db import (
     SQLITE_PATH, APP_DIR
 )
 import uuid
+
+# Import cookie manager for persistent login
+try:
+    import extra_streamlit_components as stx
+    HAS_COOKIE_MANAGER = True
+except ImportError:
+    HAS_COOKIE_MANAGER = False
 
 # Import PDF extractor (optional)
 try:
@@ -294,6 +303,31 @@ if "hours_per_week" not in st.session_state:
 if "session_length" not in st.session_state:
     st.session_state.session_length = 60
 
+# ============ AUTO-LOGIN WITH PERSISTENT TOKEN ============
+# Initialize cookie manager
+if HAS_COOKIE_MANAGER:
+    cookie_manager = stx.CookieManager()
+
+    # Try auto-login only if not already logged in
+    if st.session_state.user_id is None:
+        # Get auth token from cookie
+        auth_token = cookie_manager.get("auth_token")
+
+        if auth_token:
+            # Validate token
+            token_data = validate_token(auth_token)
+
+            if token_data:
+                # Token is valid - auto-login
+                st.session_state.user_id = token_data["user_id"]
+                st.session_state.user_email = token_data["email"]
+                st.session_state.is_admin = False  # Regular user login
+                update_last_login(token_data["user_id"])
+                # Note: We don't rerun here to avoid infinite loop
+            else:
+                # Token is invalid/expired - delete cookie
+                cookie_manager.delete("auth_token")
+
 # ============ AUTHENTICATION GATE ============
 def show_auth_page():
     """Show login/signup page. Returns True if user is authenticated."""
@@ -308,9 +342,14 @@ def show_auth_page():
         with st.form("login_form"):
             login_email = st.text_input("Email", placeholder="you@example.com", key="login_email_input")
             login_password = st.text_input("Password", type="password", key="login_password_input")
-            
+            remember_me = st.checkbox(
+                "Remember me (stay logged in for 30 days)",
+                value=True,
+                help="Keep you logged in even after closing the browser. Uncheck for session-only login."
+            )
+
             submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
-            
+
             if submitted:
                 if not login_email or not login_password:
                     st.error("Please enter email and password.")
@@ -329,8 +368,36 @@ def show_auth_page():
                         update_last_login(user["id"])
                         st.session_state.wizard_step = 0
                         st.session_state.wizard_data = {}
+
+                        # Handle "Remember me" - create persistent token
+                        if remember_me and HAS_COOKIE_MANAGER:
+                            # Generate token valid for 30 days
+                            raw_token = generate_token()
+                            expires_at = datetime.now() + timedelta(days=30)
+
+                            # Store hashed token in database
+                            store_token(user["id"], raw_token, expires_at)
+
+                            # Store raw token in cookie
+                            cookie_manager.set(
+                                "auth_token",
+                                raw_token,
+                                expires_at=expires_at,
+                                key="auth_token_cookie"
+                            )
+
                         st.success("Login successful!")
                         st.rerun()
+
+        # Safe debug info
+        if HAS_COOKIE_MANAGER:
+            with st.expander("🔧 Debug: Cookie Status", expanded=False):
+                has_cookie = cookie_manager.get("auth_token") is not None
+                st.write(f"**Auth cookie present:** `{has_cookie}`")
+                if has_cookie:
+                    st.caption("✓ Cookie detected (auto-login enabled)")
+                else:
+                    st.caption("ℹ️ No cookie found (manual login required)")
     
     # Signup tab
     with signup_tab:
@@ -450,6 +517,13 @@ if st.session_state.is_admin:
     
     # Logout button
     if st.button("🚪 Logout"):
+        # Revoke token and clear cookie (for regular users, admin doesn't use persistent tokens)
+        if HAS_COOKIE_MANAGER:
+            auth_token = cookie_manager.get("auth_token")
+            if auth_token:
+                revoke_token(auth_token)
+                cookie_manager.delete("auth_token")
+
         st.session_state.user_id = None
         st.session_state.user_email = None
         st.session_state.is_admin = False
@@ -699,6 +773,13 @@ with st.sidebar:
     st.header("👤 Account")
     st.success(f"**{st.session_state.user_email}**")
     if st.button("🚪 Logout"):
+        # Revoke persistent login token and clear cookie
+        if HAS_COOKIE_MANAGER:
+            auth_token = cookie_manager.get("auth_token")
+            if auth_token:
+                revoke_token(auth_token)
+                cookie_manager.delete("auth_token")
+
         # End session tracking
         if st.session_state.user_id and st.session_state.session_id:
             end_session(st.session_state.user_id, st.session_state.session_id)

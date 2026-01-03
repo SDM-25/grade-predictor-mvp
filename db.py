@@ -409,7 +409,27 @@ def init_db():
                 metadata TEXT
             );
             """)
-        
+
+            # Auth tokens table (for persistent login)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                token_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                last_used_at TIMESTAMP,
+                user_agent TEXT,
+                revoked_at TIMESTAMP
+            );
+            """)
+
+            # Create index on token_hash for fast lookup
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_auth_tokens_hash
+            ON auth_tokens(token_hash) WHERE revoked_at IS NULL;
+            """)
+
         else:
             # ============ SQLITE SCHEMA ============
             
@@ -624,7 +644,28 @@ def init_db():
                 FOREIGN KEY (user_id) REFERENCES users(id)
             );
             """)
-        
+
+            # Auth tokens table (for persistent login)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                last_used_at TIMESTAMP,
+                user_agent TEXT,
+                revoked_at TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+            """)
+
+            # Create index on token_hash for fast lookup
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_auth_tokens_hash
+            ON auth_tokens(token_hash);
+            """)
+
         conn.commit()
 
 # ============ PASSWORD HELPERS (bcrypt) ============
@@ -646,6 +687,141 @@ def verify_password(plain: str, hashed: str) -> bool:
         return bcrypt.checkpw(plain.encode('utf-8'), hashed.encode('utf-8'))
     except Exception:
         return False
+
+# ============ AUTH TOKEN HELPERS (persistent login) ============
+
+def generate_token() -> str:
+    """Generate a secure random token for persistent login."""
+    import secrets
+    return secrets.token_urlsafe(32)
+
+def hash_token(raw_token: str) -> str:
+    """Hash a token using SHA-256. Returns hex digest."""
+    import hashlib
+    return hashlib.sha256(raw_token.encode('utf-8')).hexdigest()
+
+def store_token(user_id: int, raw_token: str, expires_at: datetime, user_agent: str = None) -> int:
+    """
+    Store an auth token (hashed) in the database.
+    Returns the token ID.
+    """
+    token_hash = hash_token(raw_token)
+    token_id = execute_returning(
+        """INSERT INTO auth_tokens(user_id, token_hash, expires_at, user_agent)
+           VALUES(?,?,?,?)""",
+        (user_id, token_hash, expires_at.isoformat(), user_agent)
+    )
+    return token_id
+
+def validate_token(raw_token: str) -> dict:
+    """
+    Validate an auth token and return user info if valid.
+    Returns dict with user_id, email, or None if invalid/expired/revoked.
+    Also updates last_used_at timestamp if valid.
+    """
+    if not raw_token:
+        return None
+
+    token_hash = hash_token(raw_token)
+    now = datetime.now().isoformat()
+
+    # Find token and check if valid (not revoked, not expired)
+    row = fetchone(
+        """SELECT at.id, at.user_id, at.expires_at, u.email
+           FROM auth_tokens at
+           JOIN users u ON at.user_id = u.id
+           WHERE at.token_hash = ?
+             AND at.revoked_at IS NULL
+             AND at.expires_at > ?""",
+        (token_hash, now)
+    )
+
+    if not row:
+        return None
+
+    token_id = row[0]
+    user_id = row[1]
+    email = row[3]
+
+    # Update last_used_at
+    execute(
+        "UPDATE auth_tokens SET last_used_at = ? WHERE id = ?",
+        (now, token_id)
+    )
+
+    return {
+        "user_id": user_id,
+        "email": email,
+        "token_id": token_id
+    }
+
+def revoke_token(raw_token: str) -> bool:
+    """
+    Revoke an auth token (soft delete by setting revoked_at).
+    Returns True if token was found and revoked, False otherwise.
+    """
+    if not raw_token:
+        return False
+
+    token_hash = hash_token(raw_token)
+    now = datetime.now().isoformat()
+
+    # Mark as revoked
+    execute(
+        "UPDATE auth_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+        (now, token_hash)
+    )
+
+    # Check if any rows were affected
+    row = fetchone("SELECT changes()" if not is_postgres() else "SELECT 1")
+    return (row[0] if row else 0) > 0
+
+def revoke_all_user_tokens(user_id: int) -> int:
+    """
+    Revoke all auth tokens for a user.
+    Returns count of tokens revoked.
+    """
+    now = datetime.now().isoformat()
+
+    execute(
+        "UPDATE auth_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+        (now, user_id)
+    )
+
+    # Get count of revoked tokens
+    if is_postgres():
+        # Postgres doesn't have changes(), use a count query
+        row = fetchone(
+            "SELECT COUNT(*) FROM auth_tokens WHERE user_id = ? AND revoked_at = ?",
+            (user_id, now)
+        )
+    else:
+        row = fetchone("SELECT changes()")
+
+    return row[0] if row else 0
+
+def cleanup_expired_tokens(days_old: int = 90) -> int:
+    """
+    Delete expired and old revoked tokens from the database.
+    Returns count of tokens deleted.
+    """
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(days=days_old)).isoformat()
+
+    # Delete tokens that are either expired or revoked and old
+    execute(
+        """DELETE FROM auth_tokens
+           WHERE expires_at < ? OR (revoked_at IS NOT NULL AND revoked_at < ?)""",
+        (cutoff, cutoff)
+    )
+
+    # Get count of deleted tokens
+    if is_postgres():
+        # Can't get deleted count easily in Postgres, return 0
+        return 0
+    else:
+        row = fetchone("SELECT changes()")
+        return row[0] if row else 0
 
 # ============ USER HELPERS ============
 
