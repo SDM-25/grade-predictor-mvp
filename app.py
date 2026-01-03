@@ -376,24 +376,49 @@ def show_auth_page():
     with admin_tab:
         st.subheader("Admin Login")
         st.caption("For system administrators only.")
+
+        # Debug info: show which secrets are configured (without revealing values)
+        try:
+            has_username = "ADMIN_USERNAME" in st.secrets
+            has_password_hash = "ADMIN_PASSWORD_HASH" in st.secrets
+            has_password_plain = "ADMIN_PASSWORD" in st.secrets
+
+            st.info(f"🔧 **Secrets Status:**\n\n"
+                   f"- ADMIN_USERNAME: `{has_username}`\n"
+                   f"- ADMIN_PASSWORD_HASH: `{has_password_hash}`\n"
+                   f"- ADMIN_PASSWORD: `{has_password_plain}`")
+        except Exception:
+            st.warning("⚠️ Unable to read secrets configuration.")
+
         with st.form("admin_form"):
             admin_username = st.text_input("Admin Username", key="admin_username_input")
             admin_password = st.text_input("Admin Password", type="password", key="admin_password_input")
-            
+
             submitted = st.form_submit_button("Admin Login", type="primary", use_container_width=True)
-            
+
             if submitted:
                 if not admin_username or not admin_password:
                     st.error("Please enter admin credentials.")
-                elif verify_admin(admin_username, admin_password):
-                    st.session_state.user_id = -1  # Special admin ID
-                    st.session_state.user_email = admin_username
-                    st.session_state.is_admin = True
-                    log_event(None, "admin_login", f'{{"username": "{admin_username}"}}')
-                    st.success("Admin login successful!")
-                    st.rerun()
                 else:
-                    st.error("Invalid admin credentials.")
+                    # Check if secrets are configured before attempting login
+                    try:
+                        has_username = "ADMIN_USERNAME" in st.secrets
+                        has_password_hash = "ADMIN_PASSWORD_HASH" in st.secrets
+                        has_password_plain = "ADMIN_PASSWORD" in st.secrets
+
+                        if not has_username or (not has_password_hash and not has_password_plain):
+                            st.error("❌ Admin secrets not configured. Please set ADMIN_USERNAME and either ADMIN_PASSWORD_HASH or ADMIN_PASSWORD in Streamlit Cloud secrets.")
+                        elif verify_admin(admin_username, admin_password):
+                            st.session_state.user_id = -1  # Special admin ID
+                            st.session_state.user_email = admin_username
+                            st.session_state.is_admin = True
+                            log_event(None, "admin_login", f'{{"username": "{admin_username}"}}')
+                            st.success("Admin login successful!")
+                            st.rerun()
+                        else:
+                            st.error("Invalid admin credentials.")
+                    except Exception as e:
+                        st.error(f"❌ Error during admin login: {str(e)}")
     
     st.divider()
     st.caption(f"Database: {db_mode}")

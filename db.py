@@ -807,20 +807,39 @@ def get_unique_users_for_event(event_name: str, days: int = None) -> int:
 # ============ ADMIN HELPERS ============
 
 def verify_admin(username: str, password: str) -> bool:
-    """Verify admin credentials against Streamlit secrets."""
+    """Verify admin credentials against Streamlit secrets.
+
+    Supports two authentication modes:
+    1. ADMIN_USERNAME + ADMIN_PASSWORD_HASH (bcrypt hash, recommended)
+    2. ADMIN_USERNAME + ADMIN_PASSWORD (plaintext, for dev/testing)
+    """
     if not HAS_STREAMLIT:
         return False
     try:
         admin_username = st.secrets.get("ADMIN_USERNAME", None)
         admin_password_hash = st.secrets.get("ADMIN_PASSWORD_HASH", None)
-        
-        if not admin_username or not admin_password_hash:
+        admin_password_plain = st.secrets.get("ADMIN_PASSWORD", None)
+
+        # Must have username configured
+        if not admin_username:
             return False
-        
+
+        # Check username match
         if username != admin_username:
             return False
-        
-        return verify_password(password, admin_password_hash)
+
+        # Mode A: bcrypt hash (preferred, more secure)
+        if admin_password_hash:
+            return verify_password(password, admin_password_hash)
+
+        # Mode B: plaintext password (fallback for dev/testing)
+        elif admin_password_plain:
+            return password == admin_password_plain
+
+        # No password configured
+        else:
+            return False
+
     except (KeyError, FileNotFoundError):
         return False
 
