@@ -303,6 +303,16 @@ if "hours_per_week" not in st.session_state:
 if "session_length" not in st.session_state:
     st.session_state.session_length = 60
 
+# Navigation state (for deep linking from dashboard tasks)
+if "desired_tab" not in st.session_state:
+    st.session_state.desired_tab = None
+if "navigate_to_course" not in st.session_state:
+    st.session_state.navigate_to_course = None
+
+# Dashboard filters
+if "deadline_filter_days" not in st.session_state:
+    st.session_state.deadline_filter_days = 30
+
 # ============ AUTO-LOGIN WITH PERSISTENT TOKEN ============
 # Initialize cookie manager
 if HAS_COOKIE_MANAGER:
@@ -837,22 +847,39 @@ with st.sidebar:
             st.rerun()
 
     course_options = courses["course_name"].tolist() if not courses.empty else []
-    
+
     if course_options:
+        # Add "All courses" option at the beginning
+        course_options_with_all = ["🌍 All courses"] + course_options
+
+        # Handle navigation from dashboard tasks
+        if st.session_state.navigate_to_course:
+            if st.session_state.navigate_to_course in course_options:
+                st.session_state.selected_course_name = st.session_state.navigate_to_course
+            st.session_state.navigate_to_course = None
+
         # Initialize session state for selected course if needed
-        if "selected_course_name" not in st.session_state or st.session_state.selected_course_name not in course_options:
-            st.session_state.selected_course_name = course_options[0]
-        
+        if "selected_course_name" not in st.session_state:
+            st.session_state.selected_course_name = "🌍 All courses"
+        elif st.session_state.selected_course_name not in course_options_with_all:
+            st.session_state.selected_course_name = "🌍 All courses"
+
         selected_course = st.selectbox(
-            "Select course", 
-            course_options,
-            index=course_options.index(st.session_state.selected_course_name),
+            "Select course",
+            course_options_with_all,
+            index=course_options_with_all.index(st.session_state.selected_course_name),
             key="course_selector"
         )
         st.session_state.selected_course_name = selected_course
-        
-        course_id = int(courses.loc[courses["course_name"] == selected_course, "id"].iloc[0])
-        course_row = courses[courses["course_name"] == selected_course].iloc[0]
+
+        # Only get course_id and course_row if a specific course is selected
+        if selected_course != "🌍 All courses":
+            course_id = int(courses.loc[courses["course_name"] == selected_course, "id"].iloc[0])
+            course_row = courses[courses["course_name"] == selected_course].iloc[0]
+        else:
+            # For "All courses", use first course as default for operations that need a course_id
+            course_id = int(courses.iloc[0]["id"])
+            course_row = courses.iloc[0]
         
         # Ensure at least one assessment exists (backward compatibility)
         ensure_default_assessment(user_id, course_id)
@@ -959,23 +986,55 @@ if courses.empty:
 # At this point, we have courses - get the selected course from session state
 # (These variables were already set in sidebar, but we need them in main scope)
 course_options = courses["course_name"].tolist()
-selected_course = st.session_state.get("selected_course_name", course_options[0])
-if selected_course not in course_options:
-    selected_course = course_options[0]
+course_options_with_all = ["🌍 All courses"] + course_options
+selected_course = st.session_state.get("selected_course_name", "🌍 All courses")
+
+# Handle invalid selection
+if selected_course not in course_options_with_all:
+    selected_course = "🌍 All courses"
     st.session_state.selected_course_name = selected_course
 
-course_id = int(courses.loc[courses["course_name"] == selected_course, "id"].iloc[0])
-course_row = courses[courses["course_name"] == selected_course].iloc[0]
+# Get course_id and course_row only if specific course is selected
+if selected_course != "🌍 All courses":
+    course_id = int(courses.loc[courses["course_name"] == selected_course, "id"].iloc[0])
+    course_row = courses[courses["course_name"] == selected_course].iloc[0]
 
-# Get computed total marks from assessments (not from course table)
-ensure_default_assessment(user_id, course_id)
-total_marks = get_course_total_marks(user_id, course_id)
-if total_marks == 0:
-    total_marks = 120  # Fallback
-target_marks = int(course_row["target_marks"]) if course_row["target_marks"] else int(total_marks * 0.75)
+    # Get computed total marks from assessments (not from course table)
+    ensure_default_assessment(user_id, course_id)
+    total_marks = get_course_total_marks(user_id, course_id)
+    if total_marks == 0:
+        total_marks = 120  # Fallback
+    target_marks = int(course_row["target_marks"]) if course_row["target_marks"] else int(total_marks * 0.75)
+else:
+    # For "All courses" view, set defaults (will be overridden in course-specific tabs)
+    course_id = int(courses.iloc[0]["id"])
+    course_row = courses.iloc[0]
+    total_marks = 120
+    target_marks = 90
 
 st.title("📈 Exam Readiness Predictor")
 st.caption("Auto-calculated mastery from study sessions, exercises, and lectures.")
+
+# ============ NAVIGATION HINT ============
+# Show a hint when navigating from dashboard tasks
+if st.session_state.desired_tab:
+    tab_name = st.session_state.desired_tab
+    tab_icons = {
+        'Dashboard': '📊',
+        'Assessments': '📋',
+        'Exams': '📅',
+        'Topics': '📖',
+        'Import Topics': '📥',
+        'Study Sessions': '✏️',
+        'Exercises': '🏋️',
+        'Timed Attempts': '⏱️',
+        'Lecture Calendar': '🎓',
+        'Export': '📤'
+    }
+    icon = tab_icons.get(tab_name, '📌')
+    st.info(f"💡 **Quick Tip**: Click the **{icon} {tab_name}** tab above to continue with your recommended task.")
+    # Clear the hint after showing it
+    st.session_state.desired_tab = None
 
 # ============ TABS ============
 tabs = st.tabs(["📊 Dashboard", "📋 Assessments", "📅 Exams", "📖 Topics", "📥 Import Topics", "✏️ Study Sessions", "🏋️ Exercises", "⏱️ Timed Attempts", "🎓 Lecture Calendar", "📤 Export"])
@@ -987,16 +1046,20 @@ with tabs[0]:
     # ============ VIEW TOGGLE (GLOBAL vs COURSE) ============
     st.subheader("📊 Dashboard")
 
-    view_col1, view_col2 = st.columns([2, 1])
-    with view_col1:
-        dashboard_view = st.radio(
-            "View:",
-            options=["🌍 Global (All Courses)", f"📚 Course ({selected_course})"],
-            horizontal=True,
-            key="dashboard_view"
-        )
-
-    is_global_view = "Global" in dashboard_view
+    # If "All courses" is selected in sidebar, force Global view
+    if selected_course == "🌍 All courses":
+        is_global_view = True
+        st.caption("🌍 Viewing all courses (select a specific course from sidebar for course details)")
+    else:
+        view_col1, view_col2 = st.columns([2, 1])
+        with view_col1:
+            dashboard_view = st.radio(
+                "View:",
+                options=["🌍 Global (All Courses)", f"📚 Course ({selected_course})"],
+                horizontal=True,
+                key="dashboard_view"
+            )
+        is_global_view = "Global" in dashboard_view
 
     st.divider()
 
@@ -1011,9 +1074,19 @@ with tabs[0]:
             st.info("📚 No courses yet. Select a course from the sidebar to get started.")
         else:
             # ============ SECTION 1: UPCOMING ASSESSMENTS ============
-            st.subheader("📅 Upcoming Assessments (Next 30 Days)")
+            deadline_col1, deadline_col2 = st.columns([3, 1])
+            with deadline_col1:
+                st.subheader("📅 Upcoming Deadlines")
+            with deadline_col2:
+                filter_days = st.selectbox(
+                    "Show next:",
+                    options=[7, 14, 30, 365],
+                    format_func=lambda x: f"{x} days" if x < 365 else "All",
+                    index=2,  # Default to 30 days
+                    key="deadline_filter"
+                )
 
-            upcoming_assessments = get_all_upcoming_assessments(user_id, days_ahead=30)
+            upcoming_assessments = get_all_upcoming_assessments(user_id, days_ahead=filter_days)
 
             if not upcoming_assessments.empty:
                 # Format the table
@@ -1029,31 +1102,38 @@ with tabs[0]:
                     else:
                         urgency = "🟢"
 
+                    # Get readiness for this course (simplified)
+                    readiness_pct = 0
+                    cid = int(asmt['course_id'])
+                    snapshot = compute_course_snapshot(user_id, cid)
+                    if snapshot:
+                        readiness_pct = snapshot['readiness_pct']
+
                     assessment_display.append({
                         "": urgency,
+                        "Due Date": due_date.strftime("%a %d/%m/%Y"),
                         "Course": asmt['course_name'],
                         "Assessment": asmt['assessment_name'],
-                        "Type": asmt['assessment_type'],
                         "Marks": int(asmt['marks']),
-                        "Due Date": due_date.strftime("%a %d/%m/%Y"),
+                        "Readiness": f"{readiness_pct:.0f}%",
                         "Days Left": days_until
                     })
 
                 assessment_df = pd.DataFrame(assessment_display)
                 st.dataframe(assessment_df, use_container_width=True, hide_index=True)
             else:
-                st.info("✅ No upcoming assessments in the next 30 days.")
+                st.info(f"✅ No upcoming assessments in the next {filter_days} days.")
 
             st.divider()
 
-            # ============ SECTION 2: RECOMMENDED ACTIONS ============
-            st.subheader("💡 Recommended Actions (Top 10)")
+            # ============ SECTION 2: PRIORITY STACK (TOP 5) ============
+            st.subheader("🎯 Priority Stack (Top 5)")
 
-            recommended_tasks = generate_recommended_tasks(user_id, course_id=None, max_tasks=10)
+            recommended_tasks = generate_recommended_tasks(user_id, course_id=None, max_tasks=5)
 
             if recommended_tasks:
-                # Display tasks as cards
-                for i, task in enumerate(recommended_tasks[:10]):
+                # Display tasks with "Open" buttons
+                for i, task in enumerate(recommended_tasks[:5]):
                     task_type_icons = {
                         'assessment_due': '📝',
                         'timed_attempt': '⏱️',
@@ -1062,12 +1142,31 @@ with tabs[0]:
                         'setup_missing': '⚙️'
                     }
 
+                    # Map task types to tabs
+                    task_type_to_tab = {
+                        'assessment_due': 'Assessments',
+                        'timed_attempt': 'Timed Attempts',
+                        'review_topic': 'Topics',
+                        'do_exercises': 'Exercises',
+                        'setup_missing': 'Assessments'  # Default to assessments for setup
+                    }
+
                     icon = task_type_icons.get(task['task_type'], '📌')
                     course_tag = f"**{task['course_name']}**"
                     time_info = f" · ~{task['est_minutes']}min" if task.get('est_minutes') else ""
 
-                    st.markdown(f"{i+1}. {icon} {task['title']} ({course_tag}){time_info}")
-                    st.caption(f"   ↳ {task['detail']}")
+                    # Create a container for each task
+                    task_col1, task_col2 = st.columns([5, 1])
+                    with task_col1:
+                        st.markdown(f"{i+1}. {icon} {task['title']} ({course_tag}){time_info}")
+                        st.caption(f"   ↳ {task['detail']}")
+                    with task_col2:
+                        target_tab = task_type_to_tab.get(task['task_type'], 'Topics')
+                        if st.button("Open", key=f"open_task_{i}"):
+                            # Set navigation state
+                            st.session_state.navigate_to_course = task['course_name']
+                            st.session_state.desired_tab = target_tab
+                            st.rerun()
             else:
                 st.info("🎉 All caught up! No urgent actions needed.")
 
@@ -1105,48 +1204,155 @@ with tabs[0]:
 
             st.divider()
 
-            # ============ SECTION 4: QUICK COURSE SUMMARY ============
-            st.subheader("📊 All Courses Summary")
+            # ============ SECTION 4: COURSE CARDS ============
+            st.subheader("📚 Course Cards")
+            st.caption("Click on a course card to view course-specific details")
 
-            course_summaries = []
-            for _, course in all_courses.iterrows():
-                cid = int(course['id'])
-                cname = course['course_name']
+            # Create cards in a grid (3 columns)
+            num_courses = len(all_courses)
+            num_cols = 3
+            num_rows = (num_courses + num_cols - 1) // num_cols
 
-                has_topics = get_course_topic_count(user_id, cid) > 0
-                has_assessments = get_course_assessment_count(user_id, cid) > 0
+            for row_idx in range(num_rows):
+                cols = st.columns(num_cols)
+                for col_idx in range(num_cols):
+                    course_idx = row_idx * num_cols + col_idx
+                    if course_idx >= num_courses:
+                        break
 
-                if has_topics:
-                    # Compute snapshot
-                    snapshot = compute_course_snapshot(user_id, cid)
-                    if snapshot:
-                        status_icons = {
-                            'at_risk': '🔴',
-                            'borderline': '🟡',
-                            'on_track': '🟢'
-                        }
+                    course = all_courses.iloc[course_idx]
+                    cid = int(course['id'])
+                    cname = course['course_name']
 
-                        course_summaries.append({
-                            "": status_icons.get(snapshot['status'], '⚪'),
-                            "Course": cname,
-                            "Predicted": f"{snapshot['predicted_marks']:.0f}/{snapshot['total_marks']}",
-                            "Target": f"{snapshot['target_marks']}",
-                            "Readiness": f"{snapshot['readiness_pct']:.0f}%",
-                            "Days Left": snapshot['days_left'] if snapshot['days_left'] else "—"
-                        })
+                    with cols[col_idx]:
+                        has_topics = get_course_topic_count(user_id, cid) > 0
+                        has_assessments = get_course_assessment_count(user_id, cid) > 0
+
+                        if has_topics:
+                            snapshot = compute_course_snapshot(user_id, cid)
+                            if snapshot:
+                                status_icons = {
+                                    'at_risk': '🔴',
+                                    'borderline': '🟡',
+                                    'on_track': '🟢'
+                                }
+                                status = status_icons.get(snapshot['status'], '⚪')
+                                readiness = f"{snapshot['readiness_pct']:.0f}%"
+                                predicted = f"{snapshot['predicted_marks']:.0f}/{snapshot['total_marks']}"
+                                days_left = snapshot['days_left'] if snapshot['days_left'] else "—"
+                                next_asmt = snapshot['next_assessment_name'] or "No upcoming"
+                            else:
+                                status = "⚙️"
+                                readiness = "—"
+                                predicted = "—"
+                                days_left = "—"
+                                next_asmt = "Setup needed"
+                        else:
+                            status = "⚙️"
+                            readiness = "—"
+                            predicted = "—"
+                            days_left = "—"
+                            next_asmt = "Setup needed"
+
+                        # Display card
+                        with st.container():
+                            st.markdown(f"**{status} {cname}**")
+                            st.caption(f"Readiness: {readiness}")
+                            st.caption(f"Predicted: {predicted}")
+                            st.caption(f"Days left: {days_left}")
+                            st.caption(f"Next: {next_asmt}")
+                            if st.button("View Course", key=f"view_course_{cid}"):
+                                st.session_state.selected_course_name = cname
+                                st.rerun()
+
+            st.divider()
+
+            # ============ SECTION 5: WEEKLY PLAN ============
+            st.subheader("📅 Weekly Plan (Global)")
+
+            plan_col1, plan_col2 = st.columns(2)
+            with plan_col1:
+                weekly_hours = st.number_input("Hours per week:", min_value=1, max_value=50, value=st.session_state.hours_per_week, key="global_weekly_hours")
+            with plan_col2:
+                session_mins = st.number_input("Session length (minutes):", min_value=15, max_value=180, step=15, value=st.session_state.session_length, key="global_session_mins")
+
+            if st.button("🔄 Generate Weekly Plan", key="generate_global_plan"):
+                # Generate a global weekly plan across all courses
+                st.info("Generating global weekly plan across all courses...")
+
+                # Calculate total available time in minutes
+                total_minutes = weekly_hours * 60
+                num_sessions = total_minutes // session_mins
+
+                # Get all courses with their priorities
+                course_priorities = []
+                for _, course in all_courses.iterrows():
+                    cid = int(course['id'])
+                    cname = course['course_name']
+                    has_topics = get_course_topic_count(user_id, cid) > 0
+
+                    if has_topics:
+                        snapshot = compute_course_snapshot(user_id, cid)
+                        if snapshot:
+                            # Calculate priority based on urgency and gap
+                            days_left = snapshot['days_left'] if snapshot['days_left'] else 999
+                            urgency = 1.0 if days_left <= 7 else (0.8 if days_left <= 14 else (0.5 if days_left <= 30 else 0.2))
+                            gap = max(0, snapshot['target_marks'] - snapshot['predicted_marks'])
+                            readiness_gap = 100 - snapshot['readiness_pct']
+
+                            priority = 100 * urgency + 0.4 * gap + 0.2 * readiness_gap
+
+                            course_priorities.append({
+                                'course_id': cid,
+                                'course_name': cname,
+                                'priority': priority,
+                                'days_left': days_left
+                            })
+
+                if course_priorities:
+                    # Sort by priority
+                    course_priorities = sorted(course_priorities, key=lambda x: -x['priority'])
+
+                    # Allocate sessions proportionally to priority
+                    total_priority = sum(c['priority'] for c in course_priorities)
+                    plan_entries = []
+                    days_of_week = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+                    session_idx = 0
+                    for course_priority in course_priorities:
+                        allocated_sessions = int(num_sessions * (course_priority['priority'] / total_priority))
+                        if allocated_sessions < 1:
+                            allocated_sessions = 1  # At least one session per course
+
+                        for _ in range(allocated_sessions):
+                            if session_idx >= num_sessions:
+                                break
+                            day = days_of_week[session_idx % 7]
+                            plan_entries.append({
+                                'Day': day,
+                                'Course': course_priority['course_name'],
+                                'Session Type': 'Mixed Review',
+                                'Duration (min)': session_mins
+                            })
+                            session_idx += 1
+
+                    if plan_entries:
+                        plan_df = pd.DataFrame(plan_entries)
+                        st.dataframe(plan_df, use_container_width=True, hide_index=True)
+
+                        # Export button
+                        csv_data = plan_df.to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            "📥 Export Plan as CSV",
+                            csv_data,
+                            "global_study_plan.csv",
+                            "text/csv",
+                            key="download_global_plan"
+                        )
+                    else:
+                        st.info("No sessions to allocate.")
                 else:
-                    course_summaries.append({
-                        "": "⚙️",
-                        "Course": cname,
-                        "Predicted": "—",
-                        "Target": "—",
-                        "Readiness": "—",
-                        "Days Left": "Setup needed"
-                    })
-
-            if course_summaries:
-                summary_df = pd.DataFrame(course_summaries)
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                    st.info("Add topics to courses to generate a plan.")
 
     # ============ COURSE VIEW ============
     else:
@@ -1626,7 +1832,12 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("📋 Course Assessments")
     st.caption("Define exams, assignments, projects, and quizzes. Total marks = sum of all assessments.")
-    
+
+    # Guard: require specific course selection
+    if selected_course == "🌍 All courses":
+        st.info("📚 Please select a specific course from the sidebar to manage assessments.")
+        st.stop()
+
     # Ensure default assessment exists
     ensure_default_assessment(user_id, course_id)
     
@@ -1804,6 +2015,11 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("📅 Manage Exams")
     st.caption("Add multiple exams per course, each with its own marks value.")
+
+    # Guard: require specific course selection
+    if selected_course == "🌍 All courses":
+        st.info("📚 Please select a specific course from the sidebar to manage exams.")
+        st.stop()
     
     exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date", 
                         (user_id, course_id))
@@ -1895,6 +2111,11 @@ with tabs[2]:
 # ============ TOPICS TAB ============
 with tabs[3]:
     st.subheader("📖 Manage Topics")
+
+    # Guard: require specific course selection
+    if selected_course == "🌍 All courses":
+        st.info("📚 Please select a specific course from the sidebar to manage topics.")
+        st.stop()
     
     topics_df = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id", 
                          (user_id, course_id))
@@ -1951,7 +2172,12 @@ with tabs[3]:
 with tabs[4]:
     st.subheader("📥 Import Topics from PDF")
     st.caption("Upload lecture slide PDFs to automatically extract topic names.")
-    
+
+    # Guard: require specific course selection
+    if selected_course == "🌍 All courses":
+        st.info("📚 Please select a specific course from the sidebar to import topics.")
+        st.stop()
+
     if not HAS_PYMUPDF:
         st.error("⚠️ PDF extraction requires PyMuPDF. Install with: `pip install pymupdf`")
     else:
@@ -2155,7 +2381,12 @@ with tabs[4]:
 with tabs[5]:
     st.subheader("✏️ Study Sessions")
     st.caption("Log when you review/study a topic. Quality: 1=distracted, 3=normal, 5=deep focus")
-    
+
+    # Guard: require specific course selection
+    if selected_course == "🌍 All courses":
+        st.info("📚 Please select a specific course from the sidebar to log study sessions.")
+        st.stop()
+
     topics_df = read_sql("SELECT id, topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name", 
                          (user_id, course_id))
     
@@ -2218,7 +2449,12 @@ with tabs[5]:
 with tabs[6]:
     st.subheader("🏋️ Exercises")
     st.caption("Log practice questions/exercises completed for a topic.")
-    
+
+    # Guard: require specific course selection
+    if selected_course == "🌍 All courses":
+        st.info("📚 Please select a specific course from the sidebar to log exercises.")
+        st.stop()
+
     topics_df = read_sql("SELECT id, topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name", 
                          (user_id, course_id))
     
@@ -2284,7 +2520,12 @@ with tabs[6]:
 with tabs[7]:
     st.subheader("⏱️ Timed Practice Attempts")
     st.caption("Log timed past-paper or practice exam attempts. Performance on specific topics boosts your readiness predictions.")
-    
+
+    # Guard: require specific course selection
+    if selected_course == "🌍 All courses":
+        st.info("📚 Please select a specific course from the sidebar to log timed attempts.")
+        st.stop()
+
     # Get topics for multi-select
     topics_df_ta = read_sql("SELECT topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name", 
                             (user_id, course_id))
@@ -2386,7 +2627,12 @@ with tabs[7]:
 with tabs[8]:
     st.subheader("🎓 Lecture Calendar")
     st.caption("Schedule lectures and track attendance. Topics in lectures boost mastery when attended.")
-    
+
+    # Guard: require specific course selection
+    if selected_course == "🌍 All courses":
+        st.info("📚 Please select a specific course from the sidebar to manage lecture calendar.")
+        st.stop()
+
     topics_df = read_sql("SELECT topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name", 
                          (user_id, course_id))
     topic_names = topics_df["topic_name"].tolist() if not topics_df.empty else []
