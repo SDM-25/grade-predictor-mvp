@@ -133,23 +133,27 @@ def decay_factor(days_since: int) -> float:
 
 def compute_readiness(topics_with_mastery: pd.DataFrame, today: date):
     """
-    Compute readiness scores for topics based on mastery percentage.
+    Compute readiness scores for topics based on mastery.
     
-    Readiness = mastery / 5.0 (i.e., mastery as a percentage)
-    - Mastery 5/5 = 100% readiness
-    - Mastery 2.5/5 = 50% readiness
-    - Mastery 0/5 = 0% readiness
+    Readiness scale (more achievable than raw mastery/5):
+    - Mastery 2.5+ = 100% readiness (realistic target)
+    - Mastery 1.25 = 50% readiness
+    - Mastery 0.5 = 20% readiness
+    - Mastery 0 = 0% readiness
+    
+    This means a few study sessions + exercises can give meaningful readiness.
     
     Returns: (df_with_readiness, total_expected, total_weight, coverage_pct, mastery_pct, retention_pct)
     """
     df = topics_with_mastery.copy()
 
-    # Readiness is simply the mastery percentage (mastery/5)
+    # Readiness = mastery / 2.5, capped at 1.0
+    # This makes 100% readiness achievable with mastery = 2.5 (instead of 5.0)
     readiness_vals = []
     for _, r in df.iterrows():
         m = float(r["mastery"]) if pd.notna(r["mastery"]) else 0
-        # Readiness = mastery as percentage (0-1 scale)
-        readiness_vals.append(m / 5.0)
+        # Readiness = mastery / 2.5, capped at 100%
+        readiness_vals.append(min(m / 2.5, 1.0))
 
     df["readiness"] = readiness_vals
     df["expected_points"] = df["weight_points"] * df["readiness"]
@@ -157,8 +161,8 @@ def compute_readiness(topics_with_mastery: pd.DataFrame, today: date):
     total_weight = float(df["weight_points"].sum()) if not df.empty else 0.0
     total_expected = float(df["expected_points"].sum()) if not df.empty else 0.0
 
-    coverage_pct = (df.loc[df["mastery"] >= 1, "weight_points"].sum() / total_weight) if total_weight > 0 else 0.0
-    mastery_pct = (float((df["weight_points"] * (df["mastery"] / 5.0)).sum()) / total_weight) if total_weight > 0 else 0.0
+    coverage_pct = (df.loc[df["mastery"] >= 0.5, "weight_points"].sum() / total_weight) if total_weight > 0 else 0.0
+    mastery_pct = (float((df["weight_points"] * (df["mastery"] / 2.5).clip(upper=1.0)).sum()) / total_weight) if total_weight > 0 else 0.0
     retention_pct = (float((df["weight_points"] * df["readiness"]).sum()) / total_weight) if total_weight > 0 else 0.0
 
     return df, total_expected, total_weight, coverage_pct, mastery_pct, retention_pct
