@@ -2,14 +2,27 @@
 Database module with Postgres (Supabase) support and SQLite fallback.
 Includes authentication helpers with bcrypt password hashing.
 
+Supports database configuration via:
+1. DATABASE_URL environment variable (recommended for prod)
+   - postgresql://user:pass@host:port/dbname
+   - sqlite:///path/to/file.db  (or sqlite:///./relative.db)
+2. Streamlit secrets (DB_HOST, DB_NAME, etc.) - legacy support
+3. Default SQLite file (grade_predictor.db) - local development
+
 Usage:
     from db import get_conn, execute, read_sql, init_db, is_postgres
+
+    # Initialize with migrations and schema validation
+    init_db()  # Runs migrations, validates schema
 """
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Dict
+from urllib.parse import urlparse, parse_qs
 import pandas as pd
 
 # Try to import bcrypt for password hashing
@@ -35,29 +48,158 @@ except ImportError:
 
 # ============ CONNECTION CONFIG ============
 
-# FIX: Use absolute path so database persists across reloads
 # Database file lives in the same directory as this module
 APP_DIR = Path(__file__).resolve().parent
-SQLITE_PATH = str(APP_DIR / "grade_predictor.db")
+DEFAULT_SQLITE_PATH = str(APP_DIR / "grade_predictor.db")
+
+# Cache for parsed DATABASE_URL
+_db_config_cache: Optional[Dict] = None
+
+
+def _parse_database_url(url: str) -> Optional[Dict]:
+    """
+    Parse DATABASE_URL into connection config.
+
+    Supports:
+    - postgresql://user:pass@host:port/dbname
+    - postgres://user:pass@host:port/dbname (alias)
+    - sqlite:///path/to/file.db
+    - sqlite:///./relative/path.db
+
+    Returns dict with 'type' ('postgres' or 'sqlite') and connection params.
+    """
+    if not url:
+        return None
+
+    parsed = urlparse(url)
+
+    # PostgreSQL
+    if parsed.scheme in ('postgresql', 'postgres'):
+        if not HAS_PSYCOPG2:
+            return None
+        return {
+            'type': 'postgres',
+            'host': parsed.hostname or 'localhost',
+            'port': parsed.port or 5432,
+            'database': parsed.path.lstrip('/') or 'postgres',
+            'user': parsed.username or 'postgres',
+            'password': parsed.password or '',
+        }
+
+    # SQLite
+    elif parsed.scheme == 'sqlite':
+        # sqlite:///path means absolute /path
+        # sqlite:///./path means relative ./path
+        path = parsed.path
+
+        # On Windows, urlparse puts the path in netloc for sqlite:///./file.db
+        if not path and parsed.netloc:
+            path = parsed.netloc + parsed.path
+
+        # Remove leading slashes (sqlite:/// -> ///)
+        while path.startswith('/'):
+            path = path[1:]
+
+        # Handle ./ and ../ relative paths
+        if path.startswith('./') or path.startswith('.\\'):
+            path = path[2:]
+        elif path.startswith('../') or path.startswith('..\\'):
+            pass  # Keep relative path for resolution
+
+        # Resolve relative paths from APP_DIR
+        if not os.path.isabs(path):
+            path = str(APP_DIR / path)
+
+        return {
+            'type': 'sqlite',
+            'path': path,
+        }
+
+    return None
+
+
+def _get_db_config() -> Dict:
+    """
+    Get database configuration from environment or secrets.
+
+    Priority:
+    1. DATABASE_URL environment variable
+    2. Streamlit secrets (DB_HOST, etc.)
+    3. Default SQLite file
+
+    Returns dict with 'type' and connection params.
+    """
+    global _db_config_cache
+
+    # Check cache first (config doesn't change during runtime)
+    if _db_config_cache is not None:
+        return _db_config_cache
+
+    # Priority 1: DATABASE_URL environment variable
+    database_url = os.environ.get('DATABASE_URL')
+    if database_url:
+        config = _parse_database_url(database_url)
+        if config:
+            _db_config_cache = config
+            return config
+
+    # Priority 2: Streamlit secrets (legacy support)
+    if HAS_STREAMLIT and HAS_PSYCOPG2:
+        try:
+            config = {
+                'type': 'postgres',
+                'host': st.secrets["DB_HOST"],
+                'database': st.secrets["DB_NAME"],
+                'user': st.secrets["DB_USER"],
+                'password': st.secrets["DB_PASSWORD"],
+                'port': st.secrets.get("DB_PORT", 5432),
+            }
+            _db_config_cache = config
+            return config
+        except (KeyError, FileNotFoundError):
+            pass
+
+    # Priority 3: Default SQLite
+    _db_config_cache = {
+        'type': 'sqlite',
+        'path': DEFAULT_SQLITE_PATH,
+    }
+    return _db_config_cache
+
+
+def get_database_url() -> str:
+    """
+    Get the current database URL (for display/debugging).
+    Masks password in postgres URLs.
+    """
+    config = _get_db_config()
+    if config['type'] == 'postgres':
+        return f"postgresql://{config['user']}:***@{config['host']}:{config['port']}/{config['database']}"
+    else:
+        return f"sqlite:///{config['path']}"
+
+
+# Keep SQLITE_PATH for backward compatibility (used by migrate_sqlite_to_postgres.py)
+SQLITE_PATH = DEFAULT_SQLITE_PATH
+
 
 def _get_postgres_config():
-    """Get Postgres config from Streamlit secrets."""
-    if not HAS_STREAMLIT:
+    """Get Postgres config from current config. Legacy compatibility."""
+    config = _get_db_config()
+    if config['type'] != 'postgres':
         return None
-    try:
-        return {
-            "host": st.secrets["DB_HOST"],
-            "database": st.secrets["DB_NAME"],
-            "user": st.secrets["DB_USER"],
-            "password": st.secrets["DB_PASSWORD"],
-            "port": st.secrets.get("DB_PORT", 5432),
-        }
-    except (KeyError, FileNotFoundError):
-        return None
+    return {
+        'host': config['host'],
+        'database': config['database'],
+        'user': config['user'],
+        'password': config['password'],
+        'port': config['port'],
+    }
+
 
 def is_postgres() -> bool:
-    """Check if we're using Postgres (secrets available)."""
-    return HAS_PSYCOPG2 and _get_postgres_config() is not None
+    """Check if we're using Postgres."""
+    return _get_db_config()['type'] == 'postgres'
 
 # ============ CONNECTION HELPERS ============
 
@@ -67,31 +209,44 @@ def get_conn():
     Get a database connection (Postgres or SQLite).
     Use as context manager: with get_conn() as conn: ...
     """
-    if is_postgres():
-        config = _get_postgres_config()
-        conn = psycopg2.connect(**config)
+    config = _get_db_config()
+    if config['type'] == 'postgres':
+        conn = psycopg2.connect(
+            host=config['host'],
+            port=config['port'],
+            database=config['database'],
+            user=config['user'],
+            password=config['password'],
+        )
         try:
             yield conn
         finally:
             conn.close()
     else:
-        conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
+        conn = sqlite3.connect(config['path'], check_same_thread=False)
         conn.execute("PRAGMA foreign_keys = ON;")
         try:
             yield conn
         finally:
             conn.close()
 
+
 def get_conn_raw():
     """
     Get a raw connection (not context manager).
     Caller must close the connection.
     """
-    if is_postgres():
-        config = _get_postgres_config()
-        return psycopg2.connect(**config)
+    config = _get_db_config()
+    if config['type'] == 'postgres':
+        return psycopg2.connect(
+            host=config['host'],
+            port=config['port'],
+            database=config['database'],
+            user=config['user'],
+            password=config['password'],
+        )
     else:
-        conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
+        conn = sqlite3.connect(config['path'], check_same_thread=False)
         conn.execute("PRAGMA foreign_keys = ON;")
         return conn
 
@@ -208,18 +363,67 @@ def column_exists(table: str, column: str) -> bool:
 
 # ============ INIT DB ============
 
-def init_db():
+def init_db(validate: bool = True, verbose: bool = False):
     """
-    Initialize database schema with Postgres/SQLite compatibility.
-    Handles migrations safely.
+    Initialize database schema using migrations system.
+
+    This function:
+    1. Runs all pending migrations in order
+    2. Validates schema matches expected structure (prevents missing column bugs)
+
+    Args:
+        validate: If True (default), validate schema after migrations.
+                  Raises SchemaError if any expected table/column is missing.
+        verbose: If True, print migration progress.
+
+    Raises:
+        SchemaError: If validate=True and schema is invalid after migrations.
+
+    Usage:
+        # Standard initialization (recommended)
+        init_db()
+
+        # Skip validation (for testing)
+        init_db(validate=False)
+
+        # Verbose mode for debugging
+        init_db(verbose=True)
+    """
+    from migrations import run_migrations, validate_schema, SchemaError
+
+    # Run all pending migrations
+    applied = run_migrations(verbose=verbose)
+
+    # Validate schema to catch missing columns BEFORE app runs
+    if validate:
+        try:
+            validate_schema(raise_on_error=True)
+        except SchemaError as e:
+            # Re-raise with helpful message
+            raise SchemaError(
+                f"Schema validation failed: {e}\n"
+                f"Database: {get_database_url()}\n"
+                f"This is a FATAL error - the app cannot run with missing schema elements.\n"
+                f"Check migrations or database state."
+            ) from e
+
+    if verbose:
+        print(f"[db] Initialized. Using: {get_database_url()}")
+
+
+def init_db_legacy():
+    """
+    Legacy init_db implementation (inline schema creation).
+    DEPRECATED: Use init_db() which uses the migrations system.
+
+    This function is kept for backward compatibility but will be removed
+    in a future version. It handles schema creation without migrations tracking.
     """
     with get_conn() as conn:
         cur = conn.cursor()
-        
+
         if is_postgres():
-            # ============ POSTGRES SCHEMA ============
-            
-            # Users table with auth fields
+            # Users table
             if not table_exists("users"):
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -232,14 +436,13 @@ def init_db():
                 );
                 """)
             else:
-                # Migration: add missing auth columns
                 if not column_exists("users", "username"):
                     cur.execute("ALTER TABLE users ADD COLUMN username TEXT UNIQUE")
                 if not column_exists("users", "password_hash"):
                     cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''")
                 if not column_exists("users", "last_login_at"):
                     cur.execute("ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP")
-            
+
             # Courses table
             if not table_exists("courses"):
                 cur.execute("""
@@ -253,418 +456,136 @@ def init_db():
                 """)
             elif not column_exists("courses", "user_id"):
                 cur.execute("ALTER TABLE courses ADD COLUMN user_id INTEGER REFERENCES users(id)")
-            
-            # Exams table
-            if not table_exists("exams"):
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS exams (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id),
-                    course_id INTEGER NOT NULL REFERENCES courses(id),
-                    exam_name TEXT NOT NULL,
-                    exam_date DATE NOT NULL,
-                    marks INTEGER NOT NULL DEFAULT 100,
-                    actual_marks INTEGER DEFAULT NULL,
-                    is_retake INTEGER NOT NULL DEFAULT 0
-                );
-                """)
-            else:
-                if not column_exists("exams", "user_id"):
-                    cur.execute("ALTER TABLE exams ADD COLUMN user_id INTEGER REFERENCES users(id)")
-                if not column_exists("exams", "marks"):
-                    cur.execute("ALTER TABLE exams ADD COLUMN marks INTEGER DEFAULT 100")
-                if not column_exists("exams", "actual_marks"):
-                    cur.execute("ALTER TABLE exams ADD COLUMN actual_marks INTEGER DEFAULT NULL")
-            
-            # Topics table
-            if not table_exists("topics"):
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS topics (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id),
-                    course_id INTEGER NOT NULL REFERENCES courses(id),
-                    topic_name TEXT NOT NULL,
-                    weight_points REAL NOT NULL DEFAULT 0,
-                    notes TEXT
-                );
-                """)
-            elif not column_exists("topics", "user_id"):
-                cur.execute("ALTER TABLE topics ADD COLUMN user_id INTEGER REFERENCES users(id)")
-            
-            # Study sessions table
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS study_sessions (
-                id SERIAL PRIMARY KEY,
-                topic_id INTEGER NOT NULL REFERENCES topics(id),
-                session_date DATE NOT NULL,
-                duration_mins INTEGER NOT NULL DEFAULT 30,
-                quality INTEGER NOT NULL DEFAULT 3,
-                notes TEXT
-            );
-            """)
-            
-            # Exercises table
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS exercises (
-                id SERIAL PRIMARY KEY,
-                topic_id INTEGER NOT NULL REFERENCES topics(id),
-                exercise_date DATE NOT NULL,
-                total_questions INTEGER NOT NULL,
-                correct_answers INTEGER NOT NULL,
-                source TEXT,
-                notes TEXT
-            );
-            """)
-            
-            # Scheduled lectures table
-            if not table_exists("scheduled_lectures"):
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS scheduled_lectures (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id),
-                    course_id INTEGER NOT NULL REFERENCES courses(id),
-                    lecture_date DATE NOT NULL,
-                    lecture_time TEXT,
-                    topics_planned TEXT,
-                    attended INTEGER DEFAULT NULL,
-                    notes TEXT
-                );
-                """)
-            elif not column_exists("scheduled_lectures", "user_id"):
-                cur.execute("ALTER TABLE scheduled_lectures ADD COLUMN user_id INTEGER REFERENCES users(id)")
-            
-            # Timed attempts table (for past paper practice)
-            if not table_exists("timed_attempts"):
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS timed_attempts (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER REFERENCES users(id),
-                    course_id INTEGER NOT NULL REFERENCES courses(id),
-                    attempt_date DATE NOT NULL,
-                    source TEXT,
-                    minutes INTEGER NOT NULL,
-                    score_pct REAL NOT NULL,
-                    topics TEXT,
-                    notes TEXT
-                );
-                """)
-            elif not column_exists("timed_attempts", "user_id"):
-                cur.execute("ALTER TABLE timed_attempts ADD COLUMN user_id INTEGER REFERENCES users(id)")
-            
-            # Assessments table (multi-assessment support)
-            if not table_exists("assessments"):
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS assessments (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id),
-                    course_id INTEGER NOT NULL REFERENCES courses(id),
-                    assessment_name TEXT NOT NULL,
-                    assessment_type TEXT NOT NULL,
-                    marks INTEGER NOT NULL,
-                    actual_marks INTEGER DEFAULT NULL,
-                    progress_pct INTEGER DEFAULT 0,
-                    due_date DATE,
-                    is_timed INTEGER NOT NULL DEFAULT 1,
-                    notes TEXT
-                );
-                """)
-            else:
-                if not column_exists("assessments", "actual_marks"):
-                    cur.execute("ALTER TABLE assessments ADD COLUMN actual_marks INTEGER DEFAULT NULL")
-                if not column_exists("assessments", "progress_pct"):
-                    cur.execute("ALTER TABLE assessments ADD COLUMN progress_pct INTEGER DEFAULT 0")
-            
-            # Assignment work sessions table (track work done on assignments)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS assignment_work (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                assessment_id INTEGER NOT NULL REFERENCES assessments(id),
-                work_date DATE NOT NULL,
-                duration_mins INTEGER NOT NULL DEFAULT 30,
-                work_type TEXT NOT NULL DEFAULT 'research',
-                description TEXT,
-                progress_added INTEGER DEFAULT 0
-            );
-            """)
-            
-            # Sessions table (for live user tracking)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                session_id TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
-            
-            # Events table (for analytics)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER REFERENCES users(id),
-                event_name TEXT NOT NULL,
-                event_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                metadata TEXT
-            );
-            """)
 
-            # Auth tokens table (for persistent login)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS auth_tokens (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                token_hash TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP NOT NULL,
-                last_used_at TIMESTAMP,
-                user_agent TEXT,
-                revoked_at TIMESTAMP
-            );
-            """)
-
-            # Create index on token_hash for fast lookup
-            cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_auth_tokens_hash
-            ON auth_tokens(token_hash) WHERE revoked_at IS NULL;
-            """)
+            # Core tables (idempotent)
+            cur.execute("""CREATE TABLE IF NOT EXISTS exams (
+                id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                course_id INTEGER NOT NULL REFERENCES courses(id), exam_name TEXT NOT NULL,
+                exam_date DATE NOT NULL, marks INTEGER DEFAULT 100, actual_marks INTEGER,
+                is_retake INTEGER DEFAULT 0);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS topics (
+                id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                course_id INTEGER NOT NULL REFERENCES courses(id), topic_name TEXT NOT NULL,
+                weight_points REAL DEFAULT 0, notes TEXT);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS study_sessions (
+                id SERIAL PRIMARY KEY, topic_id INTEGER NOT NULL REFERENCES topics(id),
+                session_date DATE NOT NULL, duration_mins INTEGER DEFAULT 30,
+                quality INTEGER DEFAULT 3, notes TEXT);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS exercises (
+                id SERIAL PRIMARY KEY, topic_id INTEGER NOT NULL REFERENCES topics(id),
+                exercise_date DATE NOT NULL, total_questions INTEGER NOT NULL,
+                correct_answers INTEGER NOT NULL, source TEXT, notes TEXT);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS scheduled_lectures (
+                id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                course_id INTEGER NOT NULL REFERENCES courses(id), lecture_date DATE NOT NULL,
+                lecture_time TEXT, topics_planned TEXT, attended INTEGER, notes TEXT);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS timed_attempts (
+                id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                course_id INTEGER NOT NULL REFERENCES courses(id), attempt_date DATE NOT NULL,
+                source TEXT, minutes INTEGER NOT NULL, score_pct REAL NOT NULL,
+                topics TEXT, notes TEXT);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS assessments (
+                id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                course_id INTEGER NOT NULL REFERENCES courses(id), assessment_name TEXT NOT NULL,
+                assessment_type TEXT NOT NULL, marks INTEGER NOT NULL, actual_marks INTEGER,
+                progress_pct INTEGER DEFAULT 0, due_date DATE, is_timed INTEGER DEFAULT 1, notes TEXT);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS assignment_work (
+                id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                assessment_id INTEGER NOT NULL REFERENCES assessments(id), work_date DATE NOT NULL,
+                duration_mins INTEGER DEFAULT 30, work_type TEXT DEFAULT 'research',
+                description TEXT, progress_added INTEGER DEFAULT 0);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS sessions (
+                id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                session_id TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS events (
+                id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                event_name TEXT NOT NULL, event_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                metadata TEXT);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS auth_tokens (
+                id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+                token_hash TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL, last_used_at TIMESTAMP,
+                user_agent TEXT, revoked_at TIMESTAMP);""")
+            cur.execute("""CREATE INDEX IF NOT EXISTS idx_auth_tokens_hash
+                ON auth_tokens(token_hash) WHERE revoked_at IS NULL;""")
 
         else:
-            # ============ SQLITE SCHEMA ============
-            
-            # Users table with auth fields
+            # SQLite schema (simplified)
             if not table_exists("users"):
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    email TEXT UNIQUE NOT NULL,
-                    username TEXT UNIQUE,
-                    password_hash TEXT NOT NULL DEFAULT '',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_login_at TIMESTAMP
-                );
-                """)
+                cur.execute("""CREATE TABLE users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL,
+                    username TEXT UNIQUE, password_hash TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_login_at TIMESTAMP);""")
             else:
-                # Migration: add missing auth columns
                 if not column_exists("users", "username"):
                     cur.execute("ALTER TABLE users ADD COLUMN username TEXT")
                 if not column_exists("users", "password_hash"):
                     cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT DEFAULT ''")
                 if not column_exists("users", "last_login_at"):
                     cur.execute("ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP")
-            
-            # Courses table
-            if table_exists("courses"):
-                if not column_exists("courses", "user_id"):
-                    cur.execute("ALTER TABLE courses ADD COLUMN user_id INTEGER REFERENCES users(id)")
-            else:
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS courses (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    course_name TEXT NOT NULL,
-                    total_marks INTEGER NOT NULL DEFAULT 120,
-                    target_marks INTEGER NOT NULL DEFAULT 90,
-                    FOREIGN KEY (user_id) REFERENCES users(id)
-                );
-                """)
-            
-            # Exams table
-            if table_exists("exams"):
-                if not column_exists("exams", "user_id"):
-                    cur.execute("ALTER TABLE exams ADD COLUMN user_id INTEGER REFERENCES users(id)")
-                if not column_exists("exams", "marks"):
-                    cur.execute("ALTER TABLE exams ADD COLUMN marks INTEGER DEFAULT 100")
-                if not column_exists("exams", "actual_marks"):
-                    cur.execute("ALTER TABLE exams ADD COLUMN actual_marks INTEGER DEFAULT NULL")
-            else:
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS exams (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    course_id INTEGER NOT NULL,
-                    exam_name TEXT NOT NULL,
-                    exam_date DATE NOT NULL,
-                    marks INTEGER NOT NULL DEFAULT 100,
-                    actual_marks INTEGER DEFAULT NULL,
-                    is_retake INTEGER NOT NULL DEFAULT 0,
-                    FOREIGN KEY (user_id) REFERENCES users(id),
-                    FOREIGN KEY (course_id) REFERENCES courses(id)
-                );
-                """)
-            
-            # Topics table
-            if table_exists("topics"):
-                if not column_exists("topics", "user_id"):
-                    cur.execute("ALTER TABLE topics ADD COLUMN user_id INTEGER REFERENCES users(id)")
-            else:
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS topics (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    course_id INTEGER NOT NULL,
-                    topic_name TEXT NOT NULL,
-                    weight_points REAL NOT NULL DEFAULT 0,
-                    notes TEXT,
-                    FOREIGN KEY (user_id) REFERENCES users(id),
-                    FOREIGN KEY (course_id) REFERENCES courses(id)
-                );
-                """)
-            
-            # Study sessions table
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS study_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                topic_id INTEGER NOT NULL,
-                session_date DATE NOT NULL,
-                duration_mins INTEGER NOT NULL DEFAULT 30,
-                quality INTEGER NOT NULL DEFAULT 3,
-                notes TEXT,
-                FOREIGN KEY (topic_id) REFERENCES topics(id)
-            );
-            """)
-            
-            # Exercises table
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS exercises (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                topic_id INTEGER NOT NULL,
-                exercise_date DATE NOT NULL,
-                total_questions INTEGER NOT NULL,
-                correct_answers INTEGER NOT NULL,
-                source TEXT,
-                notes TEXT,
-                FOREIGN KEY (topic_id) REFERENCES topics(id)
-            );
-            """)
-            
-            # Scheduled lectures table
-            if table_exists("scheduled_lectures"):
-                if not column_exists("scheduled_lectures", "user_id"):
-                    cur.execute("ALTER TABLE scheduled_lectures ADD COLUMN user_id INTEGER REFERENCES users(id)")
-            else:
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS scheduled_lectures (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    course_id INTEGER NOT NULL,
-                    lecture_date DATE NOT NULL,
-                    lecture_time TEXT,
-                    topics_planned TEXT,
-                    attended INTEGER DEFAULT NULL,
-                    notes TEXT,
-                    FOREIGN KEY (user_id) REFERENCES users(id),
-                    FOREIGN KEY (course_id) REFERENCES courses(id)
-                );
-                """)
-            
-            # Timed attempts table (for past paper practice)
-            if table_exists("timed_attempts"):
-                if not column_exists("timed_attempts", "user_id"):
-                    cur.execute("ALTER TABLE timed_attempts ADD COLUMN user_id INTEGER REFERENCES users(id)")
-            else:
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS timed_attempts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    course_id INTEGER NOT NULL,
-                    attempt_date DATE NOT NULL,
-                    source TEXT,
-                    minutes INTEGER NOT NULL,
-                    score_pct REAL NOT NULL,
-                    topics TEXT,
-                    notes TEXT,
-                    FOREIGN KEY (user_id) REFERENCES users(id),
-                    FOREIGN KEY (course_id) REFERENCES courses(id)
-                );
-                """)
-            
-            # Assessments table (multi-assessment support)
-            if table_exists("assessments"):
-                if not column_exists("assessments", "actual_marks"):
-                    cur.execute("ALTER TABLE assessments ADD COLUMN actual_marks INTEGER DEFAULT NULL")
-                if not column_exists("assessments", "progress_pct"):
-                    cur.execute("ALTER TABLE assessments ADD COLUMN progress_pct INTEGER DEFAULT 0")
-            else:
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS assessments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    course_id INTEGER NOT NULL,
-                    assessment_name TEXT NOT NULL,
-                    assessment_type TEXT NOT NULL,
-                    marks INTEGER NOT NULL,
-                    actual_marks INTEGER DEFAULT NULL,
-                    progress_pct INTEGER DEFAULT 0,
-                    due_date DATE,
-                    is_timed INTEGER NOT NULL DEFAULT 1,
-                    notes TEXT,
-                    FOREIGN KEY (user_id) REFERENCES users(id),
-                    FOREIGN KEY (course_id) REFERENCES courses(id)
-                );
-                """)
-            
-            # Assignment work sessions table (track work done on assignments)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS assignment_work (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                assessment_id INTEGER NOT NULL,
-                work_date DATE NOT NULL,
-                duration_mins INTEGER NOT NULL DEFAULT 30,
-                work_type TEXT NOT NULL DEFAULT 'research',
-                description TEXT,
-                progress_added INTEGER DEFAULT 0,
-                FOREIGN KEY (user_id) REFERENCES users(id),
-                FOREIGN KEY (assessment_id) REFERENCES assessments(id)
-            );
-            """)
-            
-            # Sessions table (for live user tracking)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                session_id TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            );
-            """)
-            
-            # Events table (for analytics)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                event_name TEXT NOT NULL,
-                event_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                metadata TEXT,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            );
-            """)
 
-            # Auth tokens table (for persistent login)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS auth_tokens (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                token_hash TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP NOT NULL,
-                last_used_at TIMESTAMP,
-                user_agent TEXT,
-                revoked_at TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            );
-            """)
-
-            # Create index on token_hash for fast lookup
-            cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_auth_tokens_hash
-            ON auth_tokens(token_hash);
-            """)
+            # Core tables
+            cur.execute("""CREATE TABLE IF NOT EXISTS courses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                course_name TEXT NOT NULL, total_marks INTEGER DEFAULT 120,
+                target_marks INTEGER DEFAULT 90, FOREIGN KEY (user_id) REFERENCES users(id));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS exams (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                course_id INTEGER NOT NULL, exam_name TEXT NOT NULL, exam_date DATE NOT NULL,
+                marks INTEGER DEFAULT 100, actual_marks INTEGER, is_retake INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(id), FOREIGN KEY (course_id) REFERENCES courses(id));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS topics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                course_id INTEGER NOT NULL, topic_name TEXT NOT NULL,
+                weight_points REAL DEFAULT 0, notes TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id), FOREIGN KEY (course_id) REFERENCES courses(id));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS study_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, topic_id INTEGER NOT NULL,
+                session_date DATE NOT NULL, duration_mins INTEGER DEFAULT 30,
+                quality INTEGER DEFAULT 3, notes TEXT, FOREIGN KEY (topic_id) REFERENCES topics(id));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS exercises (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, topic_id INTEGER NOT NULL,
+                exercise_date DATE NOT NULL, total_questions INTEGER NOT NULL,
+                correct_answers INTEGER NOT NULL, source TEXT, notes TEXT,
+                FOREIGN KEY (topic_id) REFERENCES topics(id));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS scheduled_lectures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                course_id INTEGER NOT NULL, lecture_date DATE NOT NULL,
+                lecture_time TEXT, topics_planned TEXT, attended INTEGER, notes TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id), FOREIGN KEY (course_id) REFERENCES courses(id));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS timed_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                course_id INTEGER NOT NULL, attempt_date DATE NOT NULL,
+                source TEXT, minutes INTEGER NOT NULL, score_pct REAL NOT NULL,
+                topics TEXT, notes TEXT, FOREIGN KEY (user_id) REFERENCES users(id),
+                FOREIGN KEY (course_id) REFERENCES courses(id));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS assessments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                course_id INTEGER NOT NULL, assessment_name TEXT NOT NULL,
+                assessment_type TEXT NOT NULL, marks INTEGER NOT NULL, actual_marks INTEGER,
+                progress_pct INTEGER DEFAULT 0, due_date DATE, is_timed INTEGER DEFAULT 1, notes TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id), FOREIGN KEY (course_id) REFERENCES courses(id));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS assignment_work (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                assessment_id INTEGER NOT NULL, work_date DATE NOT NULL,
+                duration_mins INTEGER DEFAULT 30, work_type TEXT DEFAULT 'research',
+                description TEXT, progress_added INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(id), FOREIGN KEY (assessment_id) REFERENCES assessments(id));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                session_id TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (user_id) REFERENCES users(id));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                event_name TEXT NOT NULL, event_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                metadata TEXT, FOREIGN KEY (user_id) REFERENCES users(id));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS auth_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL, last_used_at TIMESTAMP,
+                user_agent TEXT, revoked_at TIMESTAMP, FOREIGN KEY (user_id) REFERENCES users(id));""")
+            cur.execute("""CREATE INDEX IF NOT EXISTS idx_auth_tokens_hash ON auth_tokens(token_hash);""")
 
         conn.commit()
 
