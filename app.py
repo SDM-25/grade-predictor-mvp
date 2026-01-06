@@ -1150,6 +1150,11 @@ with tabs[0]:
             topics_with_mastery = pd.DataFrame(mastery_data)
             topics_scored, expected_sum, weight_sum, _, _, _ = compute_readiness(topics_with_mastery, today)
             
+            # DEBUG: Show actual readiness values
+            st.write("**DEBUG - Readiness values:**")
+            for _, row in topics_scored.iterrows():
+                st.write(f"  {row['topic_name']}: mastery={row['mastery']:.2f}, readiness={row['readiness']:.4f} ({row['readiness']*100:.1f}%)")
+            
             # Create display version with readiness as percentage string
             topics_display = topics_scored.copy()
             topics_display["Readiness %"] = topics_display["readiness"].apply(lambda x: f"{int(x * 100)}%")
