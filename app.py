@@ -1148,12 +1148,21 @@ with tabs[0]:
                 })
         
             topics_with_mastery = pd.DataFrame(mastery_data)
-            topics_scored, expected_sum, weight_sum, _, _, _ = compute_readiness(topics_with_mastery, today)
+            
+            # DIRECT CALCULATION - bypassing compute_readiness to fix 1% bug
+            # Readiness = mastery / 5.0 (mastery is 0-5 scale)
+            topics_scored = topics_with_mastery.copy()
+            topics_scored["readiness"] = topics_scored["mastery"] / 5.0
+            topics_scored["expected_points"] = topics_scored["weight_points"] * topics_scored["readiness"]
+            weight_sum = float(topics_scored["weight_points"].sum()) if not topics_scored.empty else 0.0
+            expected_sum = float(topics_scored["expected_points"].sum()) if not topics_scored.empty else 0.0
             
             # DEBUG: Show actual readiness values
-            st.write("**DEBUG - Readiness values:**")
+            st.write("**DEBUG - Readiness values (DIRECT CALC):**")
             for _, row in topics_scored.iterrows():
-                st.write(f"  {row['topic_name']}: mastery={row['mastery']:.2f}, readiness={row['readiness']:.4f} ({row['readiness']*100:.1f}%)")
+                m = row['mastery']
+                r = row['readiness']
+                st.write(f"  {row['topic_name']}: mastery={m:.2f}, readiness={m}/5={r:.4f} = {int(r*100)}%")
             
             # Create display version with readiness as percentage string
             topics_display = topics_scored.copy()
