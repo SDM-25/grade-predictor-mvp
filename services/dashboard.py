@@ -92,16 +92,27 @@ def compute_course_snapshot(
     user_id: int,
     course_id: int,
     topics_with_mastery: pd.DataFrame = None,
-    retention_pct: float = None
+    retention_pct: float = None,
+    is_retake: bool = False
 ) -> Dict:
     """
     Compute a snapshot of course metrics.
     
     This is the CANONICAL function for computing course predictions.
-    All views (At-Risk, All Courses Summary, Course Dashboard) should use this.
+    ALL views (At-Risk, All Courses Summary, Course Dashboard) MUST use this.
     
-    If topics_with_mastery and retention_pct are not provided, they will be
-    computed internally from the database.
+    The prediction includes:
+    - Base readiness from topic mastery
+    - Practice blend (timed attempt scores weighted by exam proximity)
+    - Actual marks from completed assessments
+    - Proper weight scaling
+    
+    Args:
+        user_id: The user's ID
+        course_id: The course ID
+        topics_with_mastery: Pre-computed mastery data (optional, will compute if None)
+        retention_pct: Pre-computed retention (optional, will compute if None)
+        is_retake: If True, excludes lectures from mastery calculation
     
     Returns: {
         'course_id': int,
@@ -118,10 +129,14 @@ def compute_course_snapshot(
         'has_assessments': bool,
         'topic_count': int,
         'coverage_pct': float,
-        'mastery_pct': float
+        'mastery_pct': float,
+        'practice_blend': float,
+        'has_actual_marks': bool,
+        'actual_marks_earned': float,
+        'actual_marks_possible': float
     }
     """
-    from db import get_course_total_marks, get_next_due_date
+    from db import get_next_due_date
     from services.metrics import compute_mastery, compute_readiness
 
     # Get course details
@@ -139,19 +154,22 @@ def compute_course_snapshot(
     # Get assessment info
     today = date.today()
     next_due, next_assessment_name, next_is_timed = get_next_due_date(user_id, course_id, today)
-    days_left = (next_due - today).days if next_due else None
+    days_left = (next_due - today).days if next_due else 30  # Default 30 days if no due date
 
     # Check if course has content
     topic_count = get_course_topic_count(user_id, course_id)
     has_topics = topic_count > 0
     has_assessments = get_course_assessment_count(user_id, course_id) > 0
 
-    # Initialize additional metrics
+    # Initialize metrics
     coverage_pct = 0.0
     mastery_pct = 0.0
+    weight_sum = 0.0
+    practice_blend = 0.0
+    topics_scored = None
 
-    # Calculate readiness and predicted marks
-    if retention_pct is None and has_topics:
+    # ============ STEP 1: Compute base mastery and readiness ============
+    if has_topics:
         # Compute mastery data if not provided
         if topics_with_mastery is None:
             topics_df = read_sql(
@@ -162,29 +180,120 @@ def compute_course_snapshot(
                 mastery_data = []
                 for _, row in topics_df.iterrows():
                     topic_id = int(row['id'])
-                    m, last_act, ex_cnt, st_cnt, lec_cnt, timed_sig, timed_cnt = compute_mastery(topic_id, today, False)
+                    m, last_act, ex_cnt, st_cnt, lec_cnt, timed_sig, timed_cnt = compute_mastery(topic_id, today, is_retake)
                     mastery_data.append({
                         'id': topic_id,
                         'topic_name': row['topic_name'],
-                        'weight_points': row['weight_points'],
+                        'weight_points': row['weight_points'] or 0,
                         'mastery': m,
                         'last_activity': last_act,
                         'exercises': ex_cnt,
-                        'study_sessions': st_cnt
+                        'study_sessions': st_cnt,
+                        'timed_signal': timed_sig,
+                        'timed_count': timed_cnt
                     })
                 topics_with_mastery = pd.DataFrame(mastery_data)
         
         # Compute readiness from mastery data
         if topics_with_mastery is not None and not topics_with_mastery.empty:
-            _, _, _, coverage_pct, mastery_pct, retention_pct = compute_readiness(topics_with_mastery, today)
+            topics_scored, expected_sum, weight_sum, coverage_pct, mastery_pct, retention_pct = compute_readiness(topics_with_mastery, today)
         else:
             retention_pct = 0.0
-    elif retention_pct is None:
-        retention_pct = 0.0
+            expected_sum = 0.0
+    else:
+        retention_pct = 0.0 if retention_pct is None else retention_pct
+        expected_sum = 0.0
 
-    predicted_marks = total_marks * retention_pct
+    # ============ STEP 2: Apply practice blend (timed attempt weighting) ============
+    if topics_scored is not None and not topics_scored.empty and 'timed_signal' in topics_scored.columns:
+        # Time-based component (0.1 to 0.6 based on days left)
+        if days_left >= 60:
+            time_blend = 0.1
+        elif days_left >= 30:
+            time_blend = 0.1 + (60 - days_left) / 30 * 0.15
+        elif days_left >= 14:
+            time_blend = 0.25 + (30 - days_left) / 16 * 0.15
+        elif days_left >= 7:
+            time_blend = 0.4 + (14 - days_left) / 7 * 0.1
+        elif days_left >= 0:
+            time_blend = 0.5 + (7 - days_left) / 7 * 0.1
+        else:
+            time_blend = 0.6
 
-    # Determine status
+        # Lecture progress component (adds up to 0.2)
+        lecture_blend = 0.0
+        if not is_retake:
+            lecture_data = read_sql("""
+                SELECT COUNT(*) as total, SUM(CASE WHEN attended=1 THEN 1 ELSE 0 END) as attended
+                FROM scheduled_lectures WHERE user_id=? AND course_id=?
+            """, (user_id, course_id))
+            if not lecture_data.empty:
+                total_lec = int(lecture_data.iloc[0]["total"] or 0)
+                attended_lec = int(lecture_data.iloc[0]["attended"] or 0)
+                if total_lec > 0:
+                    lecture_blend = (attended_lec / total_lec) * 0.2
+
+        practice_blend = min(time_blend + lecture_blend, 0.7)
+
+        # Apply blending if there are timed signals
+        has_timed_signals = topics_scored["timed_signal"].sum() > 0
+        if practice_blend > 0 and has_timed_signals:
+            blended_readiness = []
+            for _, row in topics_scored.iterrows():
+                base_readiness = row["readiness"]
+                timed_sig = row.get("timed_signal", 0.0) or 0.0
+                if timed_sig > 0:
+                    blended = (1 - practice_blend) * base_readiness + practice_blend * timed_sig
+                else:
+                    blended = base_readiness
+                blended_readiness.append(blended)
+            topics_scored["blended_readiness"] = blended_readiness
+            topics_scored["expected_points"] = topics_scored["weight_points"] * topics_scored["blended_readiness"]
+            expected_sum = topics_scored["expected_points"].sum()
+            retention_pct = (topics_scored["weight_points"] * topics_scored["blended_readiness"]).sum() / weight_sum if weight_sum > 0 else 0
+
+    # ============ STEP 3: Scale by weight sum ============
+    base_pred = expected_sum
+    if weight_sum and abs(weight_sum - float(total_marks)) > 1e-6:
+        base_pred *= float(total_marks) / float(weight_sum)
+    predicted_marks = base_pred
+
+    # ============ STEP 4: Incorporate actual marks from completed assessments ============
+    actual_marks_earned = 0.0
+    actual_marks_possible = 0.0
+    has_actual_marks = False
+
+    completed_assessments = read_sql("""
+        SELECT marks, actual_marks FROM assessments 
+        WHERE user_id=? AND course_id=? AND actual_marks IS NOT NULL
+    """, (user_id, course_id))
+
+    completed_exams = read_sql("""
+        SELECT marks, actual_marks FROM exams 
+        WHERE user_id=? AND course_id=? AND actual_marks IS NOT NULL
+    """, (user_id, course_id))
+
+    if not completed_assessments.empty:
+        actual_marks_earned += float(completed_assessments["actual_marks"].sum())
+        actual_marks_possible += float(completed_assessments["marks"].sum())
+
+    if not completed_exams.empty:
+        actual_marks_earned += float(completed_exams["actual_marks"].sum())
+        actual_marks_possible += float(completed_exams["marks"].sum())
+
+    remaining_marks = total_marks - actual_marks_possible
+
+    if actual_marks_possible > 0:
+        has_actual_marks = True
+        if remaining_marks > 0:
+            # Blend actual results with predictions for remaining
+            predicted_remaining = (predicted_marks / total_marks) * remaining_marks if total_marks > 0 else 0
+            predicted_marks = actual_marks_earned + predicted_remaining
+        else:
+            # All assessments completed
+            predicted_marks = actual_marks_earned
+
+    # ============ STEP 5: Determine status ============
     if predicted_marks < target_marks - 10:
         status = 'at_risk'
     elif predicted_marks < target_marks:
@@ -196,9 +305,10 @@ def compute_course_snapshot(
     if DEBUG_PREDICTION:
         print(f"[DEBUG_PREDICTION] compute_course_snapshot:")
         print(f"  user_id={user_id}, course_id={course_id}, course_name={course_name}")
-        print(f"  topic_count={topic_count}, has_assessments={has_assessments}")
-        print(f"  retention_pct={retention_pct:.4f}, predicted_marks={predicted_marks:.1f}/{total_marks}")
-        print(f"  status={status}")
+        print(f"  topic_count={topic_count}, weight_sum={weight_sum:.1f}")
+        print(f"  retention_pct={retention_pct:.4f}, practice_blend={practice_blend:.2f}")
+        print(f"  actual_marks={actual_marks_earned:.1f}/{actual_marks_possible:.1f}")
+        print(f"  predicted_marks={predicted_marks:.1f}/{total_marks}, status={status}")
 
     return {
         'course_id': course_id,
@@ -206,8 +316,8 @@ def compute_course_snapshot(
         'predicted_marks': predicted_marks,
         'total_marks': total_marks,
         'target_marks': target_marks,
-        'readiness_pct': retention_pct * 100,
-        'days_left': days_left,
+        'readiness_pct': retention_pct * 100 if retention_pct else 0.0,
+        'days_left': days_left if next_due else None,
         'next_due_date': next_due,
         'next_assessment_name': next_assessment_name,
         'status': status,
@@ -215,7 +325,11 @@ def compute_course_snapshot(
         'has_assessments': has_assessments,
         'topic_count': topic_count,
         'coverage_pct': coverage_pct * 100 if coverage_pct else 0.0,
-        'mastery_pct': mastery_pct * 100 if mastery_pct else 0.0
+        'mastery_pct': mastery_pct * 100 if mastery_pct else 0.0,
+        'practice_blend': practice_blend * 100,
+        'has_actual_marks': has_actual_marks,
+        'actual_marks_earned': actual_marks_earned,
+        'actual_marks_possible': actual_marks_possible
     }
 
 
@@ -430,9 +544,7 @@ def get_at_risk_courses(user_id: int, readiness_threshold: float = 0.6, days_thr
 
     Returns: List of course snapshots that meet at-risk criteria
     
-    Note: This function pre-computes mastery data and passes it to compute_course_snapshot
-    for efficiency (avoids recomputing). The snapshot values will be identical to calling
-    compute_course_snapshot without pre-computed data.
+    Uses compute_course_snapshot for consistent predictions across all views.
     """
     at_risk = []
     courses = get_all_courses(user_id)
@@ -457,41 +569,10 @@ def get_at_risk_courses(user_id: int, readiness_threshold: float = 0.6, days_thr
         if days_left > days_threshold:
             continue
 
-        # Compute readiness
-        topics_df = read_sql(
-            "SELECT id, topic_name, weight_points FROM topics WHERE user_id=? AND course_id=?",
-            (user_id, cid)
-        )
-
-        if topics_df.empty:
-            continue
-
-        from services.metrics import compute_mastery, compute_readiness
-
-        mastery_data = []
-        for _, row in topics_df.iterrows():
-            topic_id = int(row['id'])
-            m, last_act, ex_cnt, st_cnt, lec_cnt, timed_sig, timed_cnt = compute_mastery(topic_id, today, False)
-            mastery_data.append({
-                'id': topic_id,
-                'topic_name': row['topic_name'],
-                'weight_points': row['weight_points'],
-                'mastery': m,
-                'last_activity': last_act,
-                'exercises': ex_cnt,
-                'study_sessions': st_cnt
-            })
-
-        topics_with_mastery = pd.DataFrame(mastery_data)
-        _, _, _, _, _, retention_pct = compute_readiness(topics_with_mastery, today)
-
-        if DEBUG_PREDICTION:
-            print(f"[DEBUG_PREDICTION] get_at_risk_courses: course_id={cid}, retention_pct={retention_pct:.4f}")
-
-        if retention_pct < readiness_threshold:
-            # Pass pre-computed data to avoid redundant calculation
-            snapshot = compute_course_snapshot(user_id, cid, topics_with_mastery, retention_pct)
-            if snapshot:
-                at_risk.append(snapshot)
+        # Use canonical snapshot function
+        snapshot = compute_course_snapshot(user_id, cid)
+        
+        if snapshot and snapshot['readiness_pct'] < readiness_threshold * 100:
+            at_risk.append(snapshot)
 
     return at_risk

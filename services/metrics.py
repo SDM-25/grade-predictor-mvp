@@ -133,25 +133,23 @@ def decay_factor(days_since: int) -> float:
 
 def compute_readiness(topics_with_mastery: pd.DataFrame, today: date):
     """
-    Compute readiness scores for topics based on mastery and recency.
+    Compute readiness scores for topics based on mastery percentage.
+    
+    Readiness = mastery / 5.0 (i.e., mastery as a percentage)
+    - Mastery 5/5 = 100% readiness
+    - Mastery 2.5/5 = 50% readiness
+    - Mastery 0/5 = 0% readiness
+    
     Returns: (df_with_readiness, total_expected, total_weight, coverage_pct, mastery_pct, retention_pct)
     """
     df = topics_with_mastery.copy()
 
+    # Readiness is simply the mastery percentage (mastery/5)
     readiness_vals = []
     for _, r in df.iterrows():
         m = float(r["mastery"]) if pd.notna(r["mastery"]) else 0
-        lr = r["last_activity"]
-        if pd.isna(lr) or lr is None:
-            dec = 0.6 if m > 0 else 0.0
-        else:
-            if isinstance(lr, str):
-                lr_date = pd.to_datetime(lr).date()
-            else:
-                lr_date = lr
-            days_since = (today - lr_date).days
-            dec = decay_factor(days_since)
-        readiness_vals.append((m / 5.0) * dec)
+        # Readiness = mastery as percentage (0-1 scale)
+        readiness_vals.append(m / 5.0)
 
     df["readiness"] = readiness_vals
     df["expected_points"] = df["weight_points"] * df["readiness"]

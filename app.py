@@ -37,20 +37,83 @@ try:
 except ImportError:
     HAS_PYMUPDF = False
 
-# Import services layer (pure Python business logic - NO Streamlit dependencies)
-from services import (
-    # metrics
-    compute_mastery, decay_factor, compute_readiness,
-    # dashboard
+# Import dashboard helpers
+from dashboard_helpers import (
     get_all_courses, get_all_upcoming_assessments,
     get_course_topic_count, get_course_assessment_count,
     compute_course_snapshot, generate_recommended_tasks,
-    get_at_risk_courses,
-    # recommendations
-    generate_recommendations,
-    # onboarding & demo
-    get_onboarding_status, load_demo_data, delete_demo_data, has_demo_data,
+    get_at_risk_courses
 )
+
+# Import metric computation functions (NO Streamlit UI dependencies)
+from metrics import compute_mastery, decay_factor, compute_readiness
+
+
+def generate_recommendations(topics_scored: pd.DataFrame, upcoming_lectures: pd.DataFrame, days_left: int, today: date, is_retake: bool = False) -> list:
+    """Generate smart study recommendations based on gaps, lectures, and exam proximity."""
+    recommendations = []
+    
+    if topics_scored.empty:
+        return ["Add topics to get personalized recommendations."]
+    
+    gaps = topics_scored.sort_values("gap_score", ascending=False)
+    
+    if not is_retake and not upcoming_lectures.empty:
+        for _, lec in upcoming_lectures.iterrows():
+            lec_date = pd.to_datetime(lec["lecture_date"]).date()
+            days_until = (lec_date - today).days
+            if 0 <= days_until <= 3:
+                topics_planned = lec["topics_planned"] or ""
+                for topic in topics_planned.split(","):
+                    topic = topic.strip()
+                    if topic:
+                        match = topics_scored[topics_scored["topic_name"].str.lower().str.contains(topic.lower(), na=False)]
+                        if not match.empty:
+                            mastery = match.iloc[0]["mastery"]
+                            if mastery < 2:
+                                recommendations.append(f"🔴 **URGENT**: Review **{topic}** before lecture on {lec_date.strftime('%a %d/%m')}")
+                            elif mastery < 4:
+                                recommendations.append(f"🟡 **Prep**: Brush up on **{topic}** before lecture on {lec_date.strftime('%a %d/%m')}")
+    
+    if days_left <= 7:
+        priority = "🚨 EXAM WEEK"
+        top_gaps = gaps.head(3)
+        for _, g in top_gaps.iterrows():
+            if g["readiness"] < 0.6:
+                recommendations.append(f"{priority}: Focus on **{g['topic_name']}** (weight: {g['weight_points']}, readiness: {g['readiness']*100:.0f}%)")
+    elif days_left <= 14:
+        top_gaps = gaps.head(4)
+        for _, g in top_gaps.iterrows():
+            if g["readiness"] < 0.7:
+                recommendations.append(f"⚠️ **2 weeks left**: Prioritize **{g['topic_name']}** (gap score: {g['gap_score']:.1f})")
+    elif days_left <= 30:
+        top_gaps = gaps.head(5)
+        for _, g in top_gaps.iterrows():
+            if g["mastery"] < 3:
+                recommendations.append(f"📚 Study **{g['topic_name']}** - mastery only {g['mastery']:.1f}/5")
+    
+    stale_topics = topics_scored[
+        (topics_scored["mastery"] >= 2) & 
+        (topics_scored["readiness"] < topics_scored["mastery"] / 5.0 * 0.7)
+    ].head(3)
+    for _, t in stale_topics.iterrows():
+        recommendations.append(f"🔄 **Refresh**: {t['topic_name']} - mastery decaying (last activity: {t['last_activity'] or 'never'})")
+    
+    untouched = topics_scored[topics_scored["mastery"] == 0].sort_values("weight_points", ascending=False).head(2)
+    for _, t in untouched.iterrows():
+        if t["weight_points"] > 0:
+            recommendations.append(f"🆕 **Start**: {t['topic_name']} (worth {t['weight_points']} points, not yet studied)")
+    
+    if not recommendations:
+        avg_readiness = topics_scored["readiness"].mean()
+        if avg_readiness >= 0.8:
+            recommendations.append("✅ **Great progress!** Focus on practice exams and timed exercises.")
+        elif avg_readiness >= 0.6:
+            recommendations.append("📈 **Good progress!** Keep up the consistent study sessions.")
+        else:
+            recommendations.append("📚 **More work needed.** Prioritize high-weight topics first.")
+    
+    return recommendations[:8]
 
 # ============ STREAMLIT APP ============
 
@@ -100,9 +163,9 @@ if "session_length" not in st.session_state:
     st.session_state.session_length = 60
 
 # ============ AUTO-LOGIN WITH PERSISTENT TOKEN ============
-# Initialize cookie manager (explicit key prevents DuplicateElementKey if re-imported)
+# Initialize cookie manager
 if HAS_COOKIE_MANAGER:
-    cookie_manager = stx.CookieManager(key="auth_cookie_manager")
+    cookie_manager = stx.CookieManager()
 
     # Try auto-login only if not already logged in
     if st.session_state.user_id is None:
@@ -633,17 +696,7 @@ with st.sidebar:
             st.rerun()
 
     course_options = courses["course_name"].tolist() if not courses.empty else []
-
-    # Show demo data cleanup option if demo data exists
-    if has_demo_data(user_id):
-        with st.expander("🎮 Demo Data", expanded=False):
-            st.caption("You have demo data loaded. Delete it when you're ready to use only your own data.")
-            if st.button("🗑️ Delete Demo Data", key="sidebar_delete_demo"):
-                result = delete_demo_data(user_id)
-                if result.get("deleted"):
-                    st.success("Demo data deleted!")
-                    st.rerun()
-
+    
     if course_options:
         # Initialize session state for selected course if needed
         if "selected_course_name" not in st.session_state or st.session_state.selected_course_name not in course_options:
@@ -783,33 +836,8 @@ target_marks = int(course_row["target_marks"]) if course_row["target_marks"] els
 st.title("📈 Exam Readiness Predictor")
 st.caption("Auto-calculated mastery from study sessions, exercises, and lectures.")
 
-# ============ TABS (compact labels for mobile-safe layout) ============
-tabs = st.tabs(["📊 Dash", "📋 Assess", "📅 Exams", "📖 Topics", "📥 Import", "✏️ Study", "🏋️ Exercise", "⏱️ Timed", "🎓 Calendar", "📤 Export"])
-
-# CSS to make tabs wrap on smaller screens instead of overflow/truncate
-st.markdown("""
-<style>
-    /* Allow tabs to wrap instead of overflow */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 2px;
-        flex-wrap: wrap;
-    }
-    .stTabs [data-baseweb="tab"] {
-        padding: 8px 12px;
-        font-size: 0.85rem;
-    }
-    /* Compact tabs on mobile */
-    @media (max-width: 768px) {
-        .stTabs [data-baseweb="tab-list"] {
-            justify-content: center;
-        }
-        .stTabs [data-baseweb="tab"] {
-            padding: 6px 8px;
-            font-size: 0.75rem;
-        }
-    }
-</style>
-""", unsafe_allow_html=True)
+# ============ TABS ============
+tabs = st.tabs(["📊 Dashboard", "📋 Assessments", "📅 Exams", "📖 Topics", "📥 Import Topics", "✏️ Study Sessions", "🏋️ Exercises", "⏱️ Timed Attempts", "🎓 Lecture Calendar", "📤 Export"])
 
 # ============ DASHBOARD ============
 with tabs[0]:
@@ -839,47 +867,7 @@ with tabs[0]:
         all_courses = get_all_courses(user_id)
 
         if all_courses.empty:
-            # ============ ONBOARDING FOR NEW USERS ============
-            onboarding = get_onboarding_status(user_id)
-
-            st.markdown("#### 🚀 Welcome! Let's get you started")
-            st.markdown("Complete these steps to start tracking your exam readiness:")
-
-            # Show checklist
-            for item in onboarding["checklist"]:
-                if item["completed"]:
-                    st.markdown(f"- [x] {item['icon']} ~~{item['label']}~~")
-                else:
-                    st.markdown(f"- [ ] {item['icon']} **{item['label']}**")
-
-            st.markdown("---")
-
-            # Demo data buttons
-            col1, col2, col3 = st.columns([1, 1, 2])
-
-            with col1:
-                if not onboarding["has_demo"]:
-                    if st.button("🎮 Load Demo Data", type="primary", use_container_width=True,
-                                 help="Load sample data to explore the app"):
-                        result = load_demo_data(user_id)
-                        if result.get("created"):
-                            st.success(f"✅ Demo loaded: 1 course, {result['topics']} topics, 1 assessment")
-                            st.rerun()
-                        else:
-                            st.warning(result.get("error", "Demo data already exists"))
-                else:
-                    if st.button("🗑️ Delete Demo Data", use_container_width=True,
-                                 help="Remove all demo data"):
-                        result = delete_demo_data(user_id)
-                        if result.get("deleted"):
-                            st.success("✅ Demo data deleted")
-                            st.rerun()
-
-            with col2:
-                st.markdown("")  # Spacer
-
-            st.markdown("---")
-            st.info("💡 **Tip:** Load demo data to explore the app, or add your first course in the sidebar to get started with your own data.")
+            st.info("📚 No courses yet. Select a course from the sidebar to get started.")
         else:
             # ============ SECTION 1: UPCOMING ASSESSMENTS ============
             st.subheader("📅 Upcoming Assessments (Next 30 Days)")
@@ -1087,129 +1075,33 @@ with tabs[0]:
         if topics_df.empty:
             st.info("📖 No topics added yet. Go to Topics tab to add some.")
         else:
-            mastery_data = []
-            for _, row in topics_df.iterrows():
-                m, last_act, ex_cnt, st_cnt, lec_cnt, timed_sig, timed_cnt = compute_mastery(int(row["id"]), today, is_retake)
-                mastery_data.append({
-                    "id": row["id"],
-                    "topic_name": row["topic_name"],
-                    "weight_points": row["weight_points"],
-                    "mastery": round(m, 2),
-                    "last_activity": last_act,
-                    "exercises": ex_cnt,
-                    "study_sessions": st_cnt,
-                    "lectures": lec_cnt if not is_retake else 0,
-                    "timed_signal": timed_sig,
-                    "timed_count": timed_cnt
-                })
-        
-            topics_with_mastery = pd.DataFrame(mastery_data)
-            topics_scored, expected_sum, weight_sum, coverage_pct, mastery_pct, retention_pct = compute_readiness(topics_with_mastery, today)
-        
-            # Auto-calculate practice blend based on exam proximity and lecture progress
-            # Early in course: low blend (value mastery/study more)
-            # Near exam: high blend (value practice exams more)
-        
-            # Time-based component (0.1 to 0.6 based on days left)
-            if days_left >= 60:
-                time_blend = 0.1
-            elif days_left >= 30:
-                time_blend = 0.1 + (60 - days_left) / 30 * 0.15  # 0.1 to 0.25
-            elif days_left >= 14:
-                time_blend = 0.25 + (30 - days_left) / 16 * 0.15  # 0.25 to 0.4
-            elif days_left >= 7:
-                time_blend = 0.4 + (14 - days_left) / 7 * 0.1  # 0.4 to 0.5
-            elif days_left >= 0:
-                time_blend = 0.5 + (7 - days_left) / 7 * 0.1  # 0.5 to 0.6
-            else:
-                time_blend = 0.6
-        
-            # Lecture progress component (adds up to 0.2 based on % of scheduled lectures attended)
-            lecture_blend = 0.0
-            if not is_retake:
-                all_lectures = read_sql("""
-                    SELECT COUNT(*) as total, SUM(CASE WHEN attended=1 THEN 1 ELSE 0 END) as attended
-                    FROM scheduled_lectures 
-                    WHERE user_id=? AND course_id=?
-                """, (user_id, course_id))
-                if not all_lectures.empty:
-                    total_lec = int(all_lectures.iloc[0]["total"] or 0)
-                    attended_lec = int(all_lectures.iloc[0]["attended"] or 0)
-                    if total_lec > 0:
-                        lecture_progress = attended_lec / total_lec
-                        lecture_blend = lecture_progress * 0.2  # Up to +0.2
-        
-            # Combine: cap at 0.7 (never fully ignore mastery)
-            practice_blend = min(time_blend + lecture_blend, 0.7)
-        
-            # Apply per-topic blending if there are timed signals
-            has_timed_signals = "timed_signal" in topics_scored.columns and topics_scored["timed_signal"].sum() > 0
-            if practice_blend > 0 and has_timed_signals:
-                blended_readiness = []
-                for _, row in topics_scored.iterrows():
-                    base_readiness = row["readiness"]
-                    timed_sig = row.get("timed_signal", 0.0) or 0.0
-                    if timed_sig > 0:
-                        # Blend: (1-blend)*readiness + blend*timed_signal
-                        blended = (1 - practice_blend) * base_readiness + practice_blend * timed_sig
-                    else:
-                        blended = base_readiness
-                    blended_readiness.append(blended)
-                topics_scored["blended_readiness"] = blended_readiness
-                topics_scored["expected_points"] = topics_scored["weight_points"] * topics_scored["blended_readiness"]
-                expected_sum = topics_scored["expected_points"].sum()
-                retention_pct = (topics_scored["weight_points"] * topics_scored["blended_readiness"]).sum() / weight_sum if weight_sum > 0 else 0
-
-            base_pred = expected_sum
-            if weight_sum and abs(weight_sum - float(total_marks)) > 1e-6:
-                base_pred *= float(total_marks) / float(weight_sum)
-            pred_marks = base_pred
-        
-            # ============ INCORPORATE ACTUAL MARKS ============
-            # Get actual marks from completed assessments and exams
-            completed_assessments = read_sql("""
-                SELECT marks, actual_marks FROM assessments 
-                WHERE user_id=? AND course_id=? AND actual_marks IS NOT NULL
-            """, (user_id, course_id))
-        
-            completed_exams = read_sql("""
-                SELECT marks, actual_marks FROM exams 
-                WHERE user_id=? AND course_id=? AND actual_marks IS NOT NULL
-            """, (user_id, course_id))
-        
-            # Calculate actual marks earned
-            actual_marks_earned = 0
-            actual_marks_possible = 0
-        
-            if not completed_assessments.empty:
-                actual_marks_earned += completed_assessments["actual_marks"].sum()
-                actual_marks_possible += completed_assessments["marks"].sum()
-        
-            if not completed_exams.empty:
-                actual_marks_earned += completed_exams["actual_marks"].sum()
-                actual_marks_possible += completed_exams["marks"].sum()
-        
-            # Calculate remaining marks to predict
-            remaining_marks = total_marks - actual_marks_possible
-        
-            if actual_marks_possible > 0 and remaining_marks > 0:
-                # Blend actual results with predictions for remaining assessments
-                # pred_marks is based on total_marks, so we need to scale it for remaining only
-                predicted_remaining = (pred_marks / total_marks) * remaining_marks if total_marks > 0 else 0
-                combined_pred = actual_marks_earned + predicted_remaining
-                pred_marks = combined_pred
+            # ============ USE CANONICAL SNAPSHOT FOR PREDICTIONS ============
+            # This ensures At-Risk, All Courses Summary, and Course Dashboard
+            # all show the SAME predicted values for the same course.
+            snapshot = compute_course_snapshot(user_id, course_id, is_retake=is_retake)
             
-                # Show breakdown
-                actual_pct = (actual_marks_earned / actual_marks_possible * 100) if actual_marks_possible > 0 else 0
-                st.info(f"📊 **Grade Breakdown**: Actual: {int(actual_marks_earned)}/{int(actual_marks_possible)} ({actual_pct:.0f}%) + Predicted: {predicted_remaining:.1f}/{remaining_marks}")
-            elif actual_marks_possible > 0 and remaining_marks == 0:
-                # All assessments completed
-                pred_marks = actual_marks_earned
-                actual_pct = (actual_marks_earned / total_marks * 100) if total_marks > 0 else 0
-                st.success(f"✅ **All assessments completed!** Final grade: {int(actual_marks_earned)}/{total_marks} ({actual_pct:.0f}%)")
+            # Extract values from canonical snapshot
+            pred_marks = snapshot['predicted_marks']
+            retention_pct = snapshot['readiness_pct'] / 100  # Convert back to 0-1 for display compatibility
+            coverage_pct = snapshot['coverage_pct'] / 100
+            practice_blend = snapshot['practice_blend'] / 100
+            
+            # Show actual marks breakdown if applicable
+            if snapshot['has_actual_marks']:
+                actual_marks_earned = snapshot['actual_marks_earned']
+                actual_marks_possible = snapshot['actual_marks_possible']
+                remaining_marks = total_marks - actual_marks_possible
+                
+                if remaining_marks > 0:
+                    predicted_remaining = pred_marks - actual_marks_earned
+                    actual_pct = (actual_marks_earned / actual_marks_possible * 100) if actual_marks_possible > 0 else 0
+                    st.info(f"📊 **Grade Breakdown**: Actual: {int(actual_marks_earned)}/{int(actual_marks_possible)} ({actual_pct:.0f}%) + Predicted: {predicted_remaining:.1f}/{remaining_marks}")
+                else:
+                    actual_pct = (actual_marks_earned / total_marks * 100) if total_marks > 0 else 0
+                    st.success(f"✅ **All assessments completed!** Final grade: {int(actual_marks_earned)}/{total_marks} ({actual_pct:.0f}%)")
 
             # Show prediction mode indicator
-            if has_timed_signals:
+            if practice_blend > 0:
                 blend_pct = int(practice_blend * 100)
                 if blend_pct < 25:
                     blend_desc = "📚 **Study Focus** — Predictions weighted toward mastery & review"
@@ -1234,13 +1126,29 @@ with tabs[0]:
             else:
                 c5.metric("Last Practice", "—", delta="No attempts yet")
         
-            if pred_marks < target_marks - 10:
-                status = "🔴 AT RISK"
-            elif pred_marks < target_marks:
-                status = "🟡 BORDERLINE"
-            else:
-                status = "🟢 ON TRACK"
-            st.write(f"**Status:** {status}")
+            status_icon = {"at_risk": "🔴 AT RISK", "borderline": "🟡 BORDERLINE", "on_track": "🟢 ON TRACK"}
+            st.write(f"**Status:** {status_icon.get(snapshot['status'], '⚪ UNKNOWN')}")
+            
+            # ============ COMPUTE TOPICS_SCORED FOR RECOMMENDATIONS/STUDY PLAN ============
+            # We still need topics_scored for the recommendation engine and study plan
+            mastery_data = []
+            for _, row in topics_df.iterrows():
+                m, last_act, ex_cnt, st_cnt, lec_cnt, timed_sig, timed_cnt = compute_mastery(int(row["id"]), today, is_retake)
+                mastery_data.append({
+                    "id": row["id"],
+                    "topic_name": row["topic_name"],
+                    "weight_points": row["weight_points"],
+                    "mastery": round(m, 2),
+                    "last_activity": last_act,
+                    "exercises": ex_cnt,
+                    "study_sessions": st_cnt,
+                    "lectures": lec_cnt if not is_retake else 0,
+                    "timed_signal": timed_sig,
+                    "timed_count": timed_cnt
+                })
+        
+            topics_with_mastery = pd.DataFrame(mastery_data)
+            topics_scored, expected_sum, weight_sum, _, _, _ = compute_readiness(topics_with_mastery, today)
         
             # ============ PER-ASSESSMENT BREAKDOWN ============
             st.subheader("📊 Assessment Breakdown")
