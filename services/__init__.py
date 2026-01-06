@@ -61,6 +61,7 @@ from services.dashboard import (
     compute_course_snapshot,
     generate_recommended_tasks,
     get_at_risk_courses,
+    DEBUG_PREDICTION,
 )
 
 # Recommendations
@@ -109,6 +110,7 @@ __all__ = [
     "compute_course_snapshot",
     "generate_recommended_tasks",
     "get_at_risk_courses",
+    "DEBUG_PREDICTION",
     # Recommendations
     "generate_recommendations",
 ]

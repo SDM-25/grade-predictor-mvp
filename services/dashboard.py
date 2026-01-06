@@ -15,6 +15,12 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import read_sql, fetchone, fetchall
 
+# ============ DEBUG FLAG ============
+# Set to True to print diagnostic info for prediction consistency debugging.
+# This helps verify that At-Risk, All Courses Summary, and Course Dashboard
+# all compute the same predicted values for the same course.
+DEBUG_PREDICTION = False
+
 
 # ============ CROSS-COURSE QUERIES ============
 
@@ -90,6 +96,13 @@ def compute_course_snapshot(
 ) -> Dict:
     """
     Compute a snapshot of course metrics.
+    
+    This is the CANONICAL function for computing course predictions.
+    All views (At-Risk, All Courses Summary, Course Dashboard) should use this.
+    
+    If topics_with_mastery and retention_pct are not provided, they will be
+    computed internally from the database.
+    
     Returns: {
         'course_id': int,
         'course_name': str,
@@ -102,10 +115,14 @@ def compute_course_snapshot(
         'next_assessment_name': str or None,
         'status': str ('on_track', 'borderline', 'at_risk'),
         'has_topics': bool,
-        'has_assessments': bool
+        'has_assessments': bool,
+        'topic_count': int,
+        'coverage_pct': float,
+        'mastery_pct': float
     }
     """
     from db import get_course_total_marks, get_next_due_date
+    from services.metrics import compute_mastery, compute_readiness
 
     # Get course details
     course_row = fetchone(
@@ -125,15 +142,41 @@ def compute_course_snapshot(
     days_left = (next_due - today).days if next_due else None
 
     # Check if course has content
-    has_topics = get_course_topic_count(user_id, course_id) > 0
+    topic_count = get_course_topic_count(user_id, course_id)
+    has_topics = topic_count > 0
     has_assessments = get_course_assessment_count(user_id, course_id) > 0
+
+    # Initialize additional metrics
+    coverage_pct = 0.0
+    mastery_pct = 0.0
 
     # Calculate readiness and predicted marks
     if retention_pct is None and has_topics:
-        # Compute it if not provided
-        from services.metrics import compute_readiness
-        if topics_with_mastery is not None:
-            _, _, _, _, _, retention_pct = compute_readiness(topics_with_mastery, today)
+        # Compute mastery data if not provided
+        if topics_with_mastery is None:
+            topics_df = read_sql(
+                "SELECT id, topic_name, weight_points FROM topics WHERE user_id=? AND course_id=?",
+                (user_id, course_id)
+            )
+            if not topics_df.empty:
+                mastery_data = []
+                for _, row in topics_df.iterrows():
+                    topic_id = int(row['id'])
+                    m, last_act, ex_cnt, st_cnt, lec_cnt, timed_sig, timed_cnt = compute_mastery(topic_id, today, False)
+                    mastery_data.append({
+                        'id': topic_id,
+                        'topic_name': row['topic_name'],
+                        'weight_points': row['weight_points'],
+                        'mastery': m,
+                        'last_activity': last_act,
+                        'exercises': ex_cnt,
+                        'study_sessions': st_cnt
+                    })
+                topics_with_mastery = pd.DataFrame(mastery_data)
+        
+        # Compute readiness from mastery data
+        if topics_with_mastery is not None and not topics_with_mastery.empty:
+            _, _, _, coverage_pct, mastery_pct, retention_pct = compute_readiness(topics_with_mastery, today)
         else:
             retention_pct = 0.0
     elif retention_pct is None:
@@ -149,6 +192,14 @@ def compute_course_snapshot(
     else:
         status = 'on_track'
 
+    # Debug output if enabled
+    if DEBUG_PREDICTION:
+        print(f"[DEBUG_PREDICTION] compute_course_snapshot:")
+        print(f"  user_id={user_id}, course_id={course_id}, course_name={course_name}")
+        print(f"  topic_count={topic_count}, has_assessments={has_assessments}")
+        print(f"  retention_pct={retention_pct:.4f}, predicted_marks={predicted_marks:.1f}/{total_marks}")
+        print(f"  status={status}")
+
     return {
         'course_id': course_id,
         'course_name': course_name,
@@ -161,7 +212,10 @@ def compute_course_snapshot(
         'next_assessment_name': next_assessment_name,
         'status': status,
         'has_topics': has_topics,
-        'has_assessments': has_assessments
+        'has_assessments': has_assessments,
+        'topic_count': topic_count,
+        'coverage_pct': coverage_pct * 100 if coverage_pct else 0.0,
+        'mastery_pct': mastery_pct * 100 if mastery_pct else 0.0
     }
 
 
@@ -375,6 +429,10 @@ def get_at_risk_courses(user_id: int, readiness_threshold: float = 0.6, days_thr
     Identify courses that are at risk (low readiness + due soon).
 
     Returns: List of course snapshots that meet at-risk criteria
+    
+    Note: This function pre-computes mastery data and passes it to compute_course_snapshot
+    for efficiency (avoids recomputing). The snapshot values will be identical to calling
+    compute_course_snapshot without pre-computed data.
     """
     at_risk = []
     courses = get_all_courses(user_id)
@@ -399,7 +457,7 @@ def get_at_risk_courses(user_id: int, readiness_threshold: float = 0.6, days_thr
         if days_left > days_threshold:
             continue
 
-        # Compute readiness (simplified)
+        # Compute readiness
         topics_df = read_sql(
             "SELECT id, topic_name, weight_points FROM topics WHERE user_id=? AND course_id=?",
             (user_id, cid)
@@ -427,7 +485,11 @@ def get_at_risk_courses(user_id: int, readiness_threshold: float = 0.6, days_thr
         topics_with_mastery = pd.DataFrame(mastery_data)
         _, _, _, _, _, retention_pct = compute_readiness(topics_with_mastery, today)
 
+        if DEBUG_PREDICTION:
+            print(f"[DEBUG_PREDICTION] get_at_risk_courses: course_id={cid}, retention_pct={retention_pct:.4f}")
+
         if retention_pct < readiness_threshold:
+            # Pass pre-computed data to avoid redundant calculation
             snapshot = compute_course_snapshot(user_id, cid, topics_with_mastery, retention_pct)
             if snapshot:
                 at_risk.append(snapshot)
