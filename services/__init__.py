@@ -36,6 +36,12 @@ from services.core import (
     # Analytics
     compute_course_readiness,
     generate_week_plan,
+    # Onboarding & Demo
+    is_empty_account,
+    has_demo_data,
+    load_demo_data,
+    delete_demo_data,
+    get_onboarding_status,
 )
 
 # Metrics functions
@@ -84,6 +90,12 @@ __all__ = [
     # Core - Analytics
     "compute_course_readiness",
     "generate_week_plan",
+    # Core - Onboarding & Demo
+    "is_empty_account",
+    "has_demo_data",
+    "load_demo_data",
+    "delete_demo_data",
+    "get_onboarding_status",
     # Metrics
     "compute_mastery",
     "decay_factor",

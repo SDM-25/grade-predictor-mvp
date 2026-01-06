@@ -48,6 +48,8 @@ from services import (
     get_at_risk_courses,
     # recommendations
     generate_recommendations,
+    # onboarding & demo
+    get_onboarding_status, load_demo_data, delete_demo_data, has_demo_data,
 )
 
 # ============ STREAMLIT APP ============
@@ -631,7 +633,17 @@ with st.sidebar:
             st.rerun()
 
     course_options = courses["course_name"].tolist() if not courses.empty else []
-    
+
+    # Show demo data cleanup option if demo data exists
+    if has_demo_data(user_id):
+        with st.expander("🎮 Demo Data", expanded=False):
+            st.caption("You have demo data loaded. Delete it when you're ready to use only your own data.")
+            if st.button("🗑️ Delete Demo Data", key="sidebar_delete_demo"):
+                result = delete_demo_data(user_id)
+                if result.get("deleted"):
+                    st.success("Demo data deleted!")
+                    st.rerun()
+
     if course_options:
         # Initialize session state for selected course if needed
         if "selected_course_name" not in st.session_state or st.session_state.selected_course_name not in course_options:
@@ -827,7 +839,47 @@ with tabs[0]:
         all_courses = get_all_courses(user_id)
 
         if all_courses.empty:
-            st.info("📚 No courses yet. Select a course from the sidebar to get started.")
+            # ============ ONBOARDING FOR NEW USERS ============
+            onboarding = get_onboarding_status(user_id)
+
+            st.markdown("#### 🚀 Welcome! Let's get you started")
+            st.markdown("Complete these steps to start tracking your exam readiness:")
+
+            # Show checklist
+            for item in onboarding["checklist"]:
+                if item["completed"]:
+                    st.markdown(f"- [x] {item['icon']} ~~{item['label']}~~")
+                else:
+                    st.markdown(f"- [ ] {item['icon']} **{item['label']}**")
+
+            st.markdown("---")
+
+            # Demo data buttons
+            col1, col2, col3 = st.columns([1, 1, 2])
+
+            with col1:
+                if not onboarding["has_demo"]:
+                    if st.button("🎮 Load Demo Data", type="primary", use_container_width=True,
+                                 help="Load sample data to explore the app"):
+                        result = load_demo_data(user_id)
+                        if result.get("created"):
+                            st.success(f"✅ Demo loaded: 1 course, {result['topics']} topics, 1 assessment")
+                            st.rerun()
+                        else:
+                            st.warning(result.get("error", "Demo data already exists"))
+                else:
+                    if st.button("🗑️ Delete Demo Data", use_container_width=True,
+                                 help="Remove all demo data"):
+                        result = delete_demo_data(user_id)
+                        if result.get("deleted"):
+                            st.success("✅ Demo data deleted")
+                            st.rerun()
+
+            with col2:
+                st.markdown("")  # Spacer
+
+            st.markdown("---")
+            st.info("💡 **Tip:** Load demo data to explore the app, or add your first course in the sidebar to get started with your own data.")
         else:
             # ============ SECTION 1: UPCOMING ASSESSMENTS ============
             st.subheader("📅 Upcoming Assessments (Next 30 Days)")

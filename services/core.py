@@ -948,6 +948,339 @@ def generate_week_plan(
 
 
 # ============================================================================
+# ONBOARDING & DEMO DATA
+# ============================================================================
+
+# Demo data marker - stored in notes field for easy identification
+DEMO_MARKER = "[DEMO]"
+
+
+def is_empty_account(user_id: int) -> Dict[str, Any]:
+    """
+    Check if a user account is empty (no courses, topics, or assessments).
+    Used to detect first-time users for onboarding.
+
+    Args:
+        user_id: The user's ID
+
+    Returns:
+        Dict with:
+        - is_empty: bool - True if account has no data
+        - has_courses: bool
+        - has_topics: bool
+        - has_assessments: bool
+        - course_count: int
+        - topic_count: int
+        - assessment_count: int
+    """
+    course_row = fetchone(
+        "SELECT COUNT(*) FROM courses WHERE user_id=?",
+        (user_id,)
+    )
+    topic_row = fetchone(
+        "SELECT COUNT(*) FROM topics WHERE user_id=?",
+        (user_id,)
+    )
+    assessment_row = fetchone(
+        "SELECT COUNT(*) FROM assessments WHERE user_id=?",
+        (user_id,)
+    )
+
+    course_count = course_row[0] if course_row else 0
+    topic_count = topic_row[0] if topic_row else 0
+    assessment_count = assessment_row[0] if assessment_row else 0
+
+    return {
+        "is_empty": course_count == 0,
+        "has_courses": course_count > 0,
+        "has_topics": topic_count > 0,
+        "has_assessments": assessment_count > 0,
+        "course_count": course_count,
+        "topic_count": topic_count,
+        "assessment_count": assessment_count
+    }
+
+
+def has_demo_data(user_id: int) -> bool:
+    """
+    Check if user has demo data loaded.
+
+    Args:
+        user_id: The user's ID
+
+    Returns:
+        True if demo data exists
+    """
+    # Check for demo course (notes contains DEMO_MARKER)
+    # Note: courses don't have notes, so we check assessments
+    row = fetchone(
+        f"SELECT COUNT(*) FROM assessments WHERE user_id=? AND notes LIKE '%{DEMO_MARKER}%'",
+        (user_id,)
+    )
+    return (row[0] if row else 0) > 0
+
+
+def load_demo_data(user_id: int) -> Dict[str, Any]:
+    """
+    Load demo data for a new user to explore the app.
+    Creates a sample course with topics and an assessment.
+
+    Demo data is tagged with DEMO_MARKER in notes fields for easy deletion.
+
+    Args:
+        user_id: The user's ID
+
+    Returns:
+        Dict with created item counts and IDs
+    """
+    from datetime import date, timedelta
+
+    today = date.today()
+
+    # Check if demo data already exists
+    if has_demo_data(user_id):
+        return {"error": "Demo data already loaded", "created": False}
+
+    created = {
+        "courses": 0,
+        "assessments": 0,
+        "topics": 0,
+        "course_id": None,
+        "created": True
+    }
+
+    # 1. Create demo course
+    course_result = create_course(
+        user_id=user_id,
+        name="Demo: Introduction to Economics",
+        total_marks=100,
+        target_marks=75
+    )
+    course_id = course_result["course_id"]
+    created["course_id"] = course_id
+    created["courses"] = 1
+
+    # 2. Create demo assessment (exam in 30 days)
+    exam_date = (today + timedelta(days=30)).isoformat()
+    create_assessment(
+        user_id=user_id,
+        course_id=course_id,
+        name="Final Exam",
+        assessment_type="Exam",
+        marks=100,
+        due_date=exam_date,
+        is_timed=True,
+        notes=f"{DEMO_MARKER} Sample final exam"
+    )
+    created["assessments"] = 1
+
+    # 3. Create demo topics (5 topics with varying weights)
+    demo_topics = [
+        ("Supply and Demand", 25, "Core microeconomics concept"),
+        ("Market Equilibrium", 20, "Price determination in markets"),
+        ("Elasticity", 15, "Price sensitivity analysis"),
+        ("Consumer Theory", 20, "Utility and preferences"),
+        ("Production Costs", 20, "Cost structures and optimization"),
+    ]
+
+    topic_ids = []
+    for name, weight, note in demo_topics:
+        topic_result = create_topic(
+            user_id=user_id,
+            course_id=course_id,
+            name=name,
+            weight_points=weight,
+            notes=f"{DEMO_MARKER} {note}"
+        )
+        topic_ids.append(topic_result["id"])
+    created["topics"] = len(demo_topics)
+
+    # 4. Add sample study activity for the first two topics (to show mastery)
+    if topic_ids:
+        # Study session for first topic (recent)
+        add_study_session(
+            topic_id=topic_ids[0],
+            session_date=(today - timedelta(days=2)).isoformat(),
+            duration_mins=45,
+            quality=4,
+            notes=f"{DEMO_MARKER} Sample study session"
+        )
+        # Exercise for first topic
+        add_exercise(
+            topic_id=topic_ids[0],
+            exercise_date=(today - timedelta(days=1)).isoformat(),
+            total_questions=10,
+            correct_answers=8,
+            source="Practice Problems",
+            notes=f"{DEMO_MARKER} Sample exercise"
+        )
+        # Study session for second topic (older, shows decay)
+        add_study_session(
+            topic_id=topic_ids[1],
+            session_date=(today - timedelta(days=7)).isoformat(),
+            duration_mins=30,
+            quality=3,
+            notes=f"{DEMO_MARKER} Sample study session"
+        )
+
+    log_event(user_id, "demo_data_loaded", f'{{"course_id": {course_id}}}')
+
+    return created
+
+
+def delete_demo_data(user_id: int) -> Dict[str, Any]:
+    """
+    Delete all demo data for a user.
+    Removes items tagged with DEMO_MARKER.
+
+    Args:
+        user_id: The user's ID
+
+    Returns:
+        Dict with deleted item counts
+    """
+    deleted = {
+        "courses": 0,
+        "assessments": 0,
+        "topics": 0,
+        "study_sessions": 0,
+        "exercises": 0,
+        "deleted": True
+    }
+
+    # Find demo topics (by notes marker)
+    topic_rows = fetchall(
+        f"SELECT id FROM topics WHERE user_id=? AND notes LIKE '%{DEMO_MARKER}%'",
+        (user_id,)
+    )
+    topic_ids = [r[0] for r in (topic_rows or [])]
+
+    if topic_ids:
+        # Delete study sessions for demo topics
+        with get_conn() as conn:
+            cur = conn.cursor()
+            placeholder = "%s" if is_postgres() else "?"
+            placeholders = ",".join([placeholder] * len(topic_ids))
+
+            # Delete study sessions
+            cur.execute(f"DELETE FROM study_sessions WHERE topic_id IN ({placeholders})", topic_ids)
+            deleted["study_sessions"] = cur.rowcount if hasattr(cur, 'rowcount') else len(topic_ids)
+
+            # Delete exercises
+            cur.execute(f"DELETE FROM exercises WHERE topic_id IN ({placeholders})", topic_ids)
+            deleted["exercises"] = cur.rowcount if hasattr(cur, 'rowcount') else len(topic_ids)
+
+            conn.commit()
+
+        # Delete topics
+        for topic_id in topic_ids:
+            execute("DELETE FROM topics WHERE id=? AND user_id=?", (topic_id, user_id))
+        deleted["topics"] = len(topic_ids)
+
+    # Delete demo assessments
+    execute(
+        f"DELETE FROM assessments WHERE user_id=? AND notes LIKE '%{DEMO_MARKER}%'",
+        (user_id,)
+    )
+    # Count deleted (approximation since we can't get rowcount reliably)
+    deleted["assessments"] = 1 if topic_ids else 0
+
+    # Delete demo course (by name pattern)
+    execute(
+        "DELETE FROM courses WHERE user_id=? AND course_name LIKE 'Demo:%'",
+        (user_id,)
+    )
+    deleted["courses"] = 1 if topic_ids else 0
+
+    log_event(user_id, "demo_data_deleted", None)
+
+    return deleted
+
+
+def get_onboarding_status(user_id: int) -> Dict[str, Any]:
+    """
+    Get onboarding checklist status for a user.
+    Used to show "Start here" guidance for new users.
+
+    Args:
+        user_id: The user's ID
+
+    Returns:
+        Dict with:
+        - is_new_user: bool - True if account is empty
+        - has_demo: bool - True if demo data is loaded
+        - checklist: list of {step, label, completed, action}
+    """
+    account = is_empty_account(user_id)
+    has_demo = has_demo_data(user_id)
+
+    # Build checklist
+    checklist = [
+        {
+            "step": 1,
+            "label": "Create your first course",
+            "completed": account["has_courses"],
+            "action": "add_course",
+            "icon": "📚"
+        },
+        {
+            "step": 2,
+            "label": "Add topics to study",
+            "completed": account["has_topics"],
+            "action": "add_topics",
+            "icon": "📝"
+        },
+        {
+            "step": 3,
+            "label": "Set an assessment date",
+            "completed": account["has_assessments"],
+            "action": "add_assessment",
+            "icon": "📅"
+        },
+        {
+            "step": 4,
+            "label": "Log your first study session",
+            "completed": _has_study_activity(user_id),
+            "action": "log_study",
+            "icon": "✏️"
+        }
+    ]
+
+    completed_count = sum(1 for c in checklist if c["completed"])
+
+    return {
+        "is_new_user": account["is_empty"],
+        "has_demo": has_demo,
+        "checklist": checklist,
+        "completed_count": completed_count,
+        "total_steps": len(checklist),
+        "all_complete": completed_count == len(checklist)
+    }
+
+
+def _has_study_activity(user_id: int) -> bool:
+    """Check if user has logged any study sessions or exercises."""
+    # Check study sessions via topics
+    row = fetchone(
+        """SELECT COUNT(*) FROM study_sessions ss
+           JOIN topics t ON ss.topic_id = t.id
+           WHERE t.user_id = ?""",
+        (user_id,)
+    )
+    if row and row[0] > 0:
+        return True
+
+    # Check exercises via topics
+    row = fetchone(
+        """SELECT COUNT(*) FROM exercises e
+           JOIN topics t ON e.topic_id = t.id
+           WHERE t.user_id = ?""",
+        (user_id,)
+    )
+    return (row[0] if row else 0) > 0
+
+
+# ============================================================================
 # RE-EXPORT EXISTING FUNCTIONS (for convenience)
 # ============================================================================
 
