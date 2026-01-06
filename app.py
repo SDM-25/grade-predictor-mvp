@@ -3,6 +3,7 @@ import pandas as pd
 import streamlit as st
 import re
 
+# App version: 2026-01-06-v2 (gap_score fix)
 # Import database module
 from db import (
     init_db, get_or_create_user, get_or_create_course,
