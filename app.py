@@ -1149,6 +1149,10 @@ with tabs[0]:
         
             topics_with_mastery = pd.DataFrame(mastery_data)
             topics_scored, expected_sum, weight_sum, _, _, _ = compute_readiness(topics_with_mastery, today)
+            
+            # Create display version with readiness as percentage (0-100)
+            topics_display = topics_scored.copy()
+            topics_display["readiness_pct"] = (topics_display["readiness"] * 100).round(0).astype(int)
         
             # ============ PER-ASSESSMENT BREAKDOWN ============
             st.subheader("📊 Assessment Breakdown")
@@ -1363,14 +1367,14 @@ with tabs[0]:
                 st.info("Add topics with weights to generate a study plan.")
         
             st.subheader("🎯 Top Gaps")
-            gaps = topics_scored.sort_values("gap_score", ascending=False).head(6)
+            gaps = topics_display.sort_values("gap_score", ascending=False).head(6)
             st.dataframe(
-                gaps[["topic_name", "weight_points", "mastery", "exercises", "study_sessions", "readiness", "gap_score"]],
+                gaps[["topic_name", "weight_points", "mastery", "exercises", "study_sessions", "readiness_pct", "gap_score"]],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
-                    "readiness": st.column_config.ProgressColumn("Readiness", format="%.0f%%", min_value=0, max_value=1),
+                    "readiness_pct": st.column_config.ProgressColumn("Readiness", format="%d%%", min_value=0, max_value=100),
                 }
             )
         
@@ -1388,16 +1392,16 @@ with tabs[0]:
         
             st.subheader("📋 All Topics")
             if is_retake:
-                topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "readiness"]
+                topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "readiness_pct"]
             else:
-                topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "lectures", "readiness"]
+                topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "lectures", "readiness_pct"]
             st.dataframe(
-                topics_scored[topics_display_cols],
+                topics_display[topics_display_cols],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
-                    "readiness": st.column_config.ProgressColumn("Readiness", format="%.0f%%", min_value=0, max_value=1),
+                    "readiness_pct": st.column_config.ProgressColumn("Readiness", format="%d%%", min_value=0, max_value=100),
                 }
             )
 
