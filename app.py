@@ -1154,6 +1154,8 @@ with tabs[0]:
             topics_scored = topics_with_mastery.copy()
             topics_scored["readiness"] = topics_scored["mastery"] / 5.0
             topics_scored["expected_points"] = topics_scored["weight_points"] * topics_scored["readiness"]
+            # Compute gap_score BEFORE creating topics_display (gap = weight * (1 - readiness))
+            topics_scored["gap_score"] = topics_scored["weight_points"] * (1.0 - topics_scored["readiness"])
             weight_sum = float(topics_scored["weight_points"].sum()) if not topics_scored.empty else 0.0
             expected_sum = float(topics_scored["expected_points"].sum()) if not topics_scored.empty else 0.0
             
@@ -1224,8 +1226,7 @@ with tabs[0]:
         
             st.subheader("💡 Recommended Actions (Next 5)")
 
-            # Generate recommended tasks for this course
-            topics_scored["gap_score"] = topics_scored["weight_points"] * (1.0 - topics_scored["readiness"])
+            # Generate recommended tasks for this course (gap_score already computed above)
             course_tasks = generate_recommended_tasks(user_id, course_id=course_id, max_tasks=5)
 
             if course_tasks:
@@ -1264,7 +1265,9 @@ with tabs[0]:
             mixed_sessions = 2 if days_left < 21 else (1 if days_left < 45 else 0)
             topic_sessions = max(1, num_sessions - timed_sessions - mixed_sessions)
         
-            # Get topics sorted by gap_score
+            # Get topics sorted by gap_score (defensive check)
+            if "gap_score" not in topics_scored.columns:
+                topics_scored["gap_score"] = topics_scored["weight_points"] * (1.0 - topics_scored["readiness"])
             gaps_for_plan = topics_scored.sort_values("gap_score", ascending=False).copy()
         
             if not gaps_for_plan.empty and gaps_for_plan["gap_score"].sum() > 0:
@@ -1381,6 +1384,9 @@ with tabs[0]:
                 st.info("Add topics with weights to generate a study plan.")
         
             st.subheader("🎯 Top Gaps")
+            # Defensive: ensure gap_score exists (should already be computed, but fallback if not)
+            if "gap_score" not in topics_display.columns:
+                topics_display["gap_score"] = topics_display.get("weight_points", 0) * (1.0 - topics_display.get("readiness", 0))
             gaps = topics_display.sort_values("gap_score", ascending=False).head(6)
             st.dataframe(
                 gaps[["topic_name", "weight_points", "mastery", "exercises", "study_sessions", "Readiness %", "gap_score"]],
