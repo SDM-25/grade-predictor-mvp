@@ -576,3 +576,38 @@ def get_at_risk_courses(user_id: int, readiness_threshold: float = 0.6, days_thr
             at_risk.append(snapshot)
 
     return at_risk
+
+
+# ============ PREREQUISITE STEP LOGIC ============
+
+def get_next_prerequisite_step(user_id: int, course_id: int) -> Optional[Dict]:
+    """
+    Determine the next prerequisite step for a course to guide users.
+
+    Returns:
+        None if all prerequisites are complete, otherwise a dict with:
+        - step_type: 'assessments' | 'topics'
+        - button_label: e.g., "Add assessment"
+        - message: Brief explanation
+        - tab_index: Which tab to navigate to (1=Assessments, 3=Topics)
+    """
+    assessment_count = get_course_assessment_count(user_id, course_id)
+    topic_count = get_course_topic_count(user_id, course_id)
+
+    if assessment_count == 0:
+        return {
+            'step_type': 'assessments',
+            'button_label': 'Add assessment',
+            'message': 'Add an assessment with a due date to track your progress.',
+            'tab_index': 1
+        }
+
+    if topic_count == 0:
+        return {
+            'step_type': 'topics',
+            'button_label': 'Add topics',
+            'message': 'Add topics to get personalized study recommendations.',
+            'tab_index': 3
+        }
+
+    return None  # All prerequisites complete

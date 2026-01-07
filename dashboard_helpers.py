@@ -21,6 +21,7 @@ from services.dashboard import (
     compute_course_snapshot,
     generate_recommended_tasks,
     get_at_risk_courses,
+    get_next_prerequisite_step,
     DEBUG_PREDICTION,
 )
 
@@ -33,5 +34,6 @@ __all__ = [
     "compute_course_snapshot",
     "generate_recommended_tasks",
     "get_at_risk_courses",
+    "get_next_prerequisite_step",
     "DEBUG_PREDICTION",
 ]

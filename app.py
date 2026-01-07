@@ -43,7 +43,7 @@ from dashboard_helpers import (
     get_all_courses, get_all_upcoming_assessments,
     get_course_topic_count, get_course_assessment_count,
     compute_course_snapshot, generate_recommended_tasks,
-    get_at_risk_courses
+    get_at_risk_courses, get_next_prerequisite_step
 )
 
 # Import metric computation functions (NO Streamlit UI dependencies)
@@ -1036,6 +1036,30 @@ with tabs[0]:
         else:
             st.markdown(f"### 📚 {selected_course} — Course Dashboard")
 
+            # ============ NEXT STEPS PANEL ============
+            # Check for prerequisite steps and show guided actions
+            prereq_step = get_next_prerequisite_step(user_id, course_id)
+
+            if prereq_step:
+                # Show compact "Next Steps" card for missing prerequisites
+                with st.container():
+                    st.info(f"**Next step:** {prereq_step['message']}")
+                    col1, col2 = st.columns([1, 3])
+                    with col1:
+                        if st.button(f"➕ {prereq_step['button_label']}", type="primary", use_container_width=True):
+                            # Store navigation hint in session state
+                            st.session_state[f"navigate_to_{prereq_step['step_type']}"] = True
+                            st.rerun()
+
+                    # Show navigation hint if button was clicked
+                    if st.session_state.get(f"navigate_to_{prereq_step['step_type']}", False):
+                        tab_names = {
+                            'assessments': '📋 Assessments',
+                            'topics': '📖 Topics'
+                        }
+                        st.warning(f"👆 Click the **{tab_names.get(prereq_step['step_type'], 'relevant')}** tab above.")
+                st.divider()
+
             # Get course total marks from assessments
             course_total_marks = get_course_total_marks(user_id, course_id)
             if course_total_marks == 0:
@@ -1242,204 +1266,210 @@ with tabs[0]:
                     breakdown_df = pd.DataFrame(breakdown_data)
                     st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
 
-                st.subheader("💡 Recommended Actions (Next 5)")
+                # ============ GATED: RECOMMENDED ACTIONS ============
+                # Only show recommendations when prerequisites are complete
+                if prereq_step is None:
+                    st.subheader("💡 Recommended Actions (Next 5)")
 
-            # Generate recommended tasks for this course (gap_score already computed above)
-            course_tasks = generate_recommended_tasks(user_id, course_id=course_id, max_tasks=5)
+                    # Generate recommended tasks for this course (gap_score already computed above)
+                    course_tasks = generate_recommended_tasks(user_id, course_id=course_id, max_tasks=5)
 
-            if course_tasks:
-                task_type_icons = {
-                    'assessment_due': '📝',
-                    'timed_attempt': '⏱️',
-                    'review_topic': '📖',
-                    'do_exercises': '🏋️',
-                    'setup_missing': '⚙️'
-                }
+                    if course_tasks:
+                        task_type_icons = {
+                            'assessment_due': '📝',
+                            'timed_attempt': '⏱️',
+                            'review_topic': '📖',
+                            'do_exercises': '🏋️',
+                            'setup_missing': '⚙️'
+                        }
 
-                for i, task in enumerate(course_tasks):
-                    icon = task_type_icons.get(task['task_type'], '📌')
-                    time_info = f" · ~{task['est_minutes']}min" if task.get('est_minutes') else ""
-                    st.markdown(f"{i+1}. {icon} **{task['title']}**{time_info}")
-                    st.caption(f"   ↳ {task['detail']}")
-            else:
-                # Fallback to old recommendations if task generator returns nothing
-                recs = generate_recommendations(topics_scored, upcoming_lectures, days_left, today, is_retake)
-                for rec in recs:
-                    st.markdown(f"- {rec}")
-        
-            # ============ STUDY PLAN GENERATOR ============
-            st.subheader("📅 7-Day Study Plan")
-        
-            # Get settings from session state
-            hours_per_week = st.session_state.get("hours_per_week", 10)
-            session_length = st.session_state.get("session_length", 60)
-        
-            # Calculate total sessions available
-            total_mins_per_week = hours_per_week * 60
-            num_sessions = max(1, total_mins_per_week // session_length)
-        
-            # Determine session types based on days_left
-            timed_sessions = 1 if days_left < 30 else 0
-            mixed_sessions = 2 if days_left < 21 else (1 if days_left < 45 else 0)
-            topic_sessions = max(1, num_sessions - timed_sessions - mixed_sessions)
-        
-            # Get topics sorted by gap_score (defensive check)
-            if "gap_score" not in topics_scored.columns:
-                topics_scored["gap_score"] = topics_scored["weight_points"] * (1.0 - topics_scored["readiness"])
-            gaps_for_plan = topics_scored.sort_values("gap_score", ascending=False).copy()
-        
-            if not gaps_for_plan.empty and gaps_for_plan["gap_score"].sum() > 0:
-                # Normalize gap_scores to allocate sessions proportionally
-                gaps_for_plan["session_share"] = gaps_for_plan["gap_score"] / gaps_for_plan["gap_score"].sum()
-                gaps_for_plan["allocated_sessions"] = (gaps_for_plan["session_share"] * topic_sessions).round().astype(int)
-            
-                # Ensure at least 1 session for top gaps, redistribute if needed
-                if gaps_for_plan["allocated_sessions"].sum() < topic_sessions:
-                    # Add remaining to top gap topics
-                    remaining = topic_sessions - gaps_for_plan["allocated_sessions"].sum()
-                    for i in range(int(remaining)):
-                        idx = i % len(gaps_for_plan)
-                        gaps_for_plan.iloc[idx, gaps_for_plan.columns.get_loc("allocated_sessions")] += 1
-            
-                # Build the plan
-                plan = []
-                day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-                session_idx = 0
-            
-                # Distribute topic review sessions
-                for _, row in gaps_for_plan.iterrows():
-                    topic_name = row["topic_name"]
-                    mastery = row["mastery"]
-                    sessions_for_topic = int(row["allocated_sessions"])
-        
-                    for _ in range(sessions_for_topic):
+                        for i, task in enumerate(course_tasks):
+                            icon = task_type_icons.get(task['task_type'], '📌')
+                            time_info = f" · ~{task['est_minutes']}min" if task.get('est_minutes') else ""
+                            st.markdown(f"{i+1}. {icon} **{task['title']}**{time_info}")
+                            st.caption(f"   ↳ {task['detail']}")
+                    else:
+                        # Fallback to old recommendations if task generator returns nothing
+                        recs = generate_recommendations(topics_scored, upcoming_lectures, days_left, today, is_retake)
+                        for rec in recs:
+                            st.markdown(f"- {rec}")
+
+            # ============ GATED: STUDY PLAN AND ADDITIONAL SECTIONS ============
+            # Only show when prerequisites are complete (assessments and topics exist)
+            if prereq_step is None:
+                # ============ STUDY PLAN GENERATOR ============
+                st.subheader("📅 7-Day Study Plan")
+
+                # Get settings from session state
+                hours_per_week = st.session_state.get("hours_per_week", 10)
+                session_length = st.session_state.get("session_length", 60)
+
+                # Calculate total sessions available
+                total_mins_per_week = hours_per_week * 60
+                num_sessions = max(1, total_mins_per_week // session_length)
+
+                # Determine session types based on days_left
+                timed_sessions = 1 if days_left < 30 else 0
+                mixed_sessions = 2 if days_left < 21 else (1 if days_left < 45 else 0)
+                topic_sessions = max(1, num_sessions - timed_sessions - mixed_sessions)
+
+                # Get topics sorted by gap_score (defensive check)
+                if "gap_score" not in topics_scored.columns:
+                    topics_scored["gap_score"] = topics_scored["weight_points"] * (1.0 - topics_scored["readiness"])
+                gaps_for_plan = topics_scored.sort_values("gap_score", ascending=False).copy()
+
+                if not gaps_for_plan.empty and gaps_for_plan["gap_score"].sum() > 0:
+                    # Normalize gap_scores to allocate sessions proportionally
+                    gaps_for_plan["session_share"] = gaps_for_plan["gap_score"] / gaps_for_plan["gap_score"].sum()
+                    gaps_for_plan["allocated_sessions"] = (gaps_for_plan["session_share"] * topic_sessions).round().astype(int)
+
+                    # Ensure at least 1 session for top gaps, redistribute if needed
+                    if gaps_for_plan["allocated_sessions"].sum() < topic_sessions:
+                        # Add remaining to top gap topics
+                        remaining = topic_sessions - gaps_for_plan["allocated_sessions"].sum()
+                        for i in range(int(remaining)):
+                            idx = i % len(gaps_for_plan)
+                            gaps_for_plan.iloc[idx, gaps_for_plan.columns.get_loc("allocated_sessions")] += 1
+
+                    # Build the plan
+                    plan = []
+                    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                    session_idx = 0
+
+                    # Distribute topic review sessions
+                    for _, row in gaps_for_plan.iterrows():
+                        topic_name = row["topic_name"]
+                        mastery = row["mastery"]
+                        sessions_for_topic = int(row["allocated_sessions"])
+
+                        for _ in range(sessions_for_topic):
+                            if session_idx >= num_sessions:
+                                break
+                            day = day_names[session_idx % 7]
+                            # Determine session type based on mastery
+                            if mastery < 2:
+                                session_type = "📖 Review"
+                            elif mastery < 4:
+                                session_type = "✏️ Exercises"
+                            else:
+                                session_type = "🔄 Refresh"
+
+                            plan.append({
+                                "Day": day,
+                                "Topic": topic_name,
+                                "Type": session_type,
+                                "Duration": f"{session_length} mins"
+                            })
+                            session_idx += 1
+
+                    # Add mixed practice sessions
+                    for i in range(mixed_sessions):
                         if session_idx >= num_sessions:
                             break
                         day = day_names[session_idx % 7]
-                        # Determine session type based on mastery
-                        if mastery < 2:
-                            session_type = "📖 Review"
-                        elif mastery < 4:
-                            session_type = "✏️ Exercises"
-                        else:
-                            session_type = "🔄 Refresh"
-            
+                        top_3_topics = ", ".join(gaps_for_plan.head(3)["topic_name"].tolist())
                         plan.append({
                             "Day": day,
-                            "Topic": topic_name,
-                            "Type": session_type,
+                            "Topic": f"Mixed: {top_3_topics}",
+                            "Type": "🎯 Mixed Practice",
                             "Duration": f"{session_length} mins"
                         })
                         session_idx += 1
-            
-                # Add mixed practice sessions
-                for i in range(mixed_sessions):
-                    if session_idx >= num_sessions:
-                        break
-                    day = day_names[session_idx % 7]
-                    top_3_topics = ", ".join(gaps_for_plan.head(3)["topic_name"].tolist())
-                    plan.append({
-                        "Day": day,
-                        "Topic": f"Mixed: {top_3_topics}",
-                        "Type": "🎯 Mixed Practice",
-                        "Duration": f"{session_length} mins"
-                    })
-                    session_idx += 1
-            
-                # Add timed attempt sessions
-                for i in range(timed_sessions):
-                    if session_idx >= num_sessions:
-                        break
-                    day = day_names[session_idx % 7]
-                    plan.append({
-                        "Day": day,
-                        "Topic": "Full Paper / Past Exam",
-                        "Type": "⏱️ Timed Attempt",
-                        "Duration": f"{session_length * 2} mins"  # Timed attempts are longer
-                    })
-                    session_idx += 1
-            
-                # Sort by day order
-                day_order = {d: i for i, d in enumerate(day_names)}
-                plan_df = pd.DataFrame(plan)
-                if not plan_df.empty:
-                    plan_df["day_order"] = plan_df["Day"].map(day_order)
-                    plan_df = plan_df.sort_values("day_order").drop("day_order", axis=1).reset_index(drop=True)
-        
-                    # Display the plan
-                    st.dataframe(
-                        plan_df,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Day": st.column_config.TextColumn("📆 Day"),
-                            "Topic": st.column_config.TextColumn("📚 Topic"),
-                            "Type": st.column_config.TextColumn("🎯 Session Type"),
-                            "Duration": st.column_config.TextColumn("⏱️ Duration"),
-                        }
-                    )
-        
-                    # Plan summary
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.caption(f"📊 **{len(plan_df)} sessions** this week")
-                    with col2:
-                        total_study_time = sum([int(d.split()[0]) for d in plan_df["Duration"]])
-                        st.caption(f"⏱️ **{total_study_time // 60}h {total_study_time % 60}m** total")
-                    with col3:
-                        st.caption(f"🎯 Prioritizing: **{gaps_for_plan.iloc[0]['topic_name']}**")
-        
-                    # Export button
-                    csv_data = plan_df.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "📥 Export Plan as CSV",
-                        csv_data,
-                        f"study_plan_{selected_course.replace(' ', '_')}.csv",
-                        "text/csv",
-                        key="download_study_plan"
-                    )
-            else:
-                st.info("Add topics with weights to generate a study plan.")
-        
-            st.subheader("🎯 Top Gaps")
-            # Defensive: ensure gap_score exists (should already be computed, but fallback if not)
-            if "gap_score" not in topics_display.columns:
-                topics_display["gap_score"] = topics_display.get("weight_points", 0) * (1.0 - topics_display.get("readiness", 0))
-            gaps = topics_display.sort_values("gap_score", ascending=False).head(6)
-            st.dataframe(
-                gaps[["topic_name", "weight_points", "mastery", "exercises", "study_sessions", "Readiness %", "gap_score"]],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
-                }
-            )
-        
-            if not is_retake and not upcoming_lectures.empty:
-                st.subheader("📅 Upcoming Lectures")
-                upcoming_lectures["lecture_date"] = pd.to_datetime(upcoming_lectures["lecture_date"])
+
+                    # Add timed attempt sessions
+                    for i in range(timed_sessions):
+                        if session_idx >= num_sessions:
+                            break
+                        day = day_names[session_idx % 7]
+                        plan.append({
+                            "Day": day,
+                            "Topic": "Full Paper / Past Exam",
+                            "Type": "⏱️ Timed Attempt",
+                            "Duration": f"{session_length * 2} mins"  # Timed attempts are longer
+                        })
+                        session_idx += 1
+
+                    # Sort by day order
+                    day_order = {d: i for i, d in enumerate(day_names)}
+                    plan_df = pd.DataFrame(plan)
+                    if not plan_df.empty:
+                        plan_df["day_order"] = plan_df["Day"].map(day_order)
+                        plan_df = plan_df.sort_values("day_order").drop("day_order", axis=1).reset_index(drop=True)
+
+                        # Display the plan
+                        st.dataframe(
+                            plan_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Day": st.column_config.TextColumn("📆 Day"),
+                                "Topic": st.column_config.TextColumn("📚 Topic"),
+                                "Type": st.column_config.TextColumn("🎯 Session Type"),
+                                "Duration": st.column_config.TextColumn("⏱️ Duration"),
+                            }
+                        )
+
+                        # Plan summary
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.caption(f"📊 **{len(plan_df)} sessions** this week")
+                        with col2:
+                            total_study_time = sum([int(d.split()[0]) for d in plan_df["Duration"]])
+                            st.caption(f"⏱️ **{total_study_time // 60}h {total_study_time % 60}m** total")
+                        with col3:
+                            st.caption(f"🎯 Prioritizing: **{gaps_for_plan.iloc[0]['topic_name']}**")
+
+                        # Export button
+                        csv_data = plan_df.to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            "📥 Export Plan as CSV",
+                            csv_data,
+                            f"study_plan_{selected_course.replace(' ', '_')}.csv",
+                            "text/csv",
+                            key="download_study_plan"
+                        )
+                else:
+                    st.info("Add topics with weights to generate a study plan.")
+
+                st.subheader("🎯 Top Gaps")
+                # Defensive: ensure gap_score exists (should already be computed, but fallback if not)
+                if "gap_score" not in topics_display.columns:
+                    topics_display["gap_score"] = topics_display.get("weight_points", 0) * (1.0 - topics_display.get("readiness", 0))
+                gaps = topics_display.sort_values("gap_score", ascending=False).head(6)
                 st.dataframe(
-                    upcoming_lectures[["lecture_date", "lecture_time", "topics_planned"]].head(5),
+                    gaps[["topic_name", "weight_points", "mastery", "exercises", "study_sessions", "Readiness %", "gap_score"]],
                     use_container_width=True,
                     hide_index=True,
                     column_config={
-                        "lecture_date": st.column_config.DateColumn("Date", format="ddd DD/MM"),
+                        "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
                     }
                 )
-        
-            st.subheader("📋 All Topics")
-            if is_retake:
-                topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "Readiness %"]
-            else:
-                topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "lectures", "Readiness %"]
-            st.dataframe(
-                topics_display[topics_display_cols],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
-                }
-            )
+
+                if not is_retake and not upcoming_lectures.empty:
+                    st.subheader("📅 Upcoming Lectures")
+                    upcoming_lectures["lecture_date"] = pd.to_datetime(upcoming_lectures["lecture_date"])
+                    st.dataframe(
+                        upcoming_lectures[["lecture_date", "lecture_time", "topics_planned"]].head(5),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "lecture_date": st.column_config.DateColumn("Date", format="ddd DD/MM"),
+                        }
+                    )
+
+                st.subheader("📋 All Topics")
+                if is_retake:
+                    topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "Readiness %"]
+                else:
+                    topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "lectures", "Readiness %"]
+                st.dataframe(
+                    topics_display[topics_display_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
+                    }
+                )
 
 # ============ ASSESSMENTS TAB ============
 with tabs[1]:
