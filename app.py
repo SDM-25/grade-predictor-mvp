@@ -842,7 +842,8 @@ st.title("📈 Exam Readiness Predictor")
 st.caption("Auto-calculated mastery from study sessions, exercises, and lectures.")
 
 # ============ TABS ============
-tabs = st.tabs(["📊 Dashboard", "📋 Assessments", "📅 Exams", "📖 Topics", "📥 Import Topics", "✏️ Study Sessions", "🏋️ Exercises", "⏱️ Timed Attempts", "🎓 Lecture Calendar", "📤 Export"])
+# Simplified 3-tab layout: Dashboard, Exams (setup), Study (log sessions)
+tabs = st.tabs(["📊 Dashboard", "📅 Exams", "📚 Study"])
 
 # ============ DASHBOARD ============
 with tabs[0]:
@@ -1471,111 +1472,205 @@ with tabs[0]:
                     }
                 )
 
-# ============ ASSESSMENTS TAB ============
+# ============ EXAMS TAB (Setup) ============
+# Contains: Exams (main), Assessments, Topics, Import Topics
 with tabs[1]:
-    st.subheader("📋 Course Assessments")
-    st.caption("Define exams, assignments, projects, and quizzes. Total marks = sum of all assessments.")
-    
-    # Ensure default assessment exists
-    ensure_default_assessment(user_id, course_id)
-    
-    # Add new assessment form
-    st.write("**Add New Assessment:**")
-    with st.form("add_assessment"):
+    st.subheader("📅 Exam Setup")
+    st.caption("Set up your exams, assessments, and topics for this course.")
+
+    # ============ EXAMS SECTION (Main - always visible) ============
+    st.write("### Add Exam")
+
+    # Show highlight if navigating from empty state
+    if st.session_state.get("navigate_to_exams", False):
+        st.success("👇 **Add your first exam below to start tracking your readiness!**")
+        st.session_state.navigate_to_exams = False
+
+    exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date",
+                        (user_id, course_id))
+
+    with st.form("add_exam"):
         col1, col2, col3 = st.columns(3)
         with col1:
-            asmt_name = st.text_input("Assessment name *", placeholder="e.g., Midterm Exam")
-            asmt_type = st.selectbox("Type", ["Exam", "Assignment", "Project", "Quiz", "Other"])
+            exam_name = st.text_input("Exam name", placeholder="e.g., Midterm, Final Exam")
         with col2:
-            asmt_marks = st.number_input("Marks *", min_value=1, value=50, help="How many marks is this worth?")
-            asmt_due = st.date_input("Due date (optional)", value=None)
+            exam_date_input = st.date_input("Exam date", value=date.today() + timedelta(days=60))
         with col3:
-            asmt_timed = st.checkbox("⏱️ Timed (exam-like)", value=True, 
-                                     help="Check for exams/quizzes, uncheck for assignments/projects")
-            asmt_notes = st.text_input("Notes (optional)")
-        
-        if st.form_submit_button("➕ Add Assessment", type="primary"):
-            if asmt_name.strip():
-                execute_returning(
-                    """INSERT INTO assessments(user_id, course_id, assessment_name, assessment_type, marks, due_date, is_timed, notes)
-                       VALUES(?,?,?,?,?,?,?,?)""",
-                    (user_id, course_id, asmt_name.strip(), asmt_type, asmt_marks, 
-                     str(asmt_due) if asmt_due else None, 1 if asmt_timed else 0, asmt_notes)
-                )
-                st.success(f"Added: {asmt_name} ({asmt_marks} marks)")
+            exam_marks = st.number_input("Marks", min_value=1, value=100, help="How many marks is this exam worth?")
+
+        is_retake_input = st.checkbox("🔄 This is a retake (no lectures)", value=False,
+                                      help="Retake exams exclude lectures from readiness calculations")
+
+        if st.form_submit_button("➕ Add Exam", type="primary"):
+            if exam_name.strip():
+                execute_returning("INSERT INTO exams(user_id, course_id, exam_name, exam_date, marks, is_retake) VALUES(?,?,?,?,?,?)",
+                                 (user_id, course_id, exam_name.strip(), str(exam_date_input), exam_marks, 1 if is_retake_input else 0))
+                st.success(f"Exam '{exam_name}' added ({exam_marks} marks)!")
                 st.rerun()
             else:
-                st.error("Please enter an assessment name.")
-    
-    st.divider()
-    
-    # Display existing assessments
-    assessments_df = read_sql("""
-        SELECT id, assessment_name, assessment_type, marks, actual_marks, progress_pct, due_date, is_timed, notes 
-        FROM assessments WHERE user_id=? AND course_id=? ORDER BY due_date, id
-    """, (user_id, course_id))
-    
-    if not assessments_df.empty:
+                st.error("Please enter an exam name.")
+
+    if not exams_df.empty:
+        st.divider()
+
         # Calculate completed vs pending
-        completed_count = assessments_df["actual_marks"].notna().sum()
-        total_marks = assessments_df["marks"].sum()
-        actual_earned = assessments_df["actual_marks"].fillna(0).sum()
-        
-        st.write(f"**Your Assessments ({len(assessments_df)} total, {total_marks} marks possible):**")
+        if "actual_marks" not in exams_df.columns:
+            exams_df["actual_marks"] = None
+        completed_count = exams_df["actual_marks"].notna().sum()
+        total_exam_marks = exams_df["marks"].sum() if "marks" in exams_df.columns else 0
+        actual_earned = exams_df["actual_marks"].fillna(0).sum()
+
+        st.write(f"**Your Exams ({len(exams_df)} total):**")
         if completed_count > 0:
             st.caption(f"✅ {completed_count} completed — Actual marks earned: **{int(actual_earned)}**")
-        
-        # Convert date for display
-        assessments_df["due_date"] = pd.to_datetime(assessments_df["due_date"], errors="coerce")
-        assessments_df["delete"] = False
-        # Ensure progress_pct has default value
-        if "progress_pct" not in assessments_df.columns:
-            assessments_df["progress_pct"] = 0
-        assessments_df["progress_pct"] = assessments_df["progress_pct"].fillna(0).astype(int)
-        
-        edited_assessments = st.data_editor(
-            assessments_df[["id", "assessment_name", "assessment_type", "marks", "actual_marks", "progress_pct", "due_date", "is_timed", "notes", "delete"]],
+
+        exams_df["exam_date"] = pd.to_datetime(exams_df["exam_date"])
+        exams_df["delete"] = False
+
+        edited_exams = st.data_editor(
+            exams_df[["id", "exam_name", "exam_date", "marks", "actual_marks", "is_retake", "delete"]],
             column_config={
                 "id": st.column_config.NumberColumn("ID", disabled=True),
-                "assessment_name": st.column_config.TextColumn("Name"),
-                "assessment_type": st.column_config.SelectboxColumn("Type", options=["Exam", "Assignment", "Project", "Quiz", "Other"]),
+                "exam_name": st.column_config.TextColumn("Exam Name"),
+                "exam_date": st.column_config.DateColumn("Date"),
                 "marks": st.column_config.NumberColumn("Max Marks", min_value=1),
                 "actual_marks": st.column_config.NumberColumn("Actual Marks", min_value=0, help="Enter your score once completed"),
-                "progress_pct": st.column_config.ProgressColumn("Progress %", format="%d%%", min_value=0, max_value=100, help="Work progress (for assignments)"),
-                "due_date": st.column_config.DateColumn("Due Date"),
-                "is_timed": st.column_config.CheckboxColumn("Timed?"),
-                "notes": st.column_config.TextColumn("Notes"),
+                "is_retake": st.column_config.CheckboxColumn("Retake?"),
                 "delete": st.column_config.CheckboxColumn("Delete?")
             },
             use_container_width=True,
             hide_index=True,
-            key="assessments_editor"
+            key="exams_editor"
         )
-        
+
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("💾 Save Changes"):
-                for _, row in edited_assessments.iterrows():
+            if st.button("💾 Save Exam Changes"):
+                for _, row in edited_exams.iterrows():
                     if not row["delete"]:
-                        due_str = str(row["due_date"].date()) if pd.notna(row["due_date"]) else None
                         actual = int(row["actual_marks"]) if pd.notna(row["actual_marks"]) else None
-                        progress = int(row["progress_pct"]) if pd.notna(row["progress_pct"]) else 0
                         execute(
-                            """UPDATE assessments SET assessment_name=?, assessment_type=?, marks=?, 
-                               actual_marks=?, progress_pct=?, due_date=?, is_timed=?, notes=? WHERE id=? AND user_id=?""",
-                            (row["assessment_name"], row["assessment_type"], int(row["marks"]),
-                             actual, progress, due_str, 1 if row["is_timed"] else 0, row["notes"], int(row["id"]), user_id)
+                            "UPDATE exams SET exam_name=?, exam_date=?, marks=?, actual_marks=?, is_retake=? WHERE id=? AND user_id=?",
+                            (row["exam_name"], pd.to_datetime(row["exam_date"]).strftime("%Y-%m-%d"),
+                             int(row["marks"]), actual, 1 if row["is_retake"] else 0, int(row["id"]), user_id)
                         )
-                st.success("Changes saved!")
+                st.success("Exams updated!")
                 st.rerun()
         with col2:
-            if st.button("🗑️ Delete Selected"):
-                to_delete = edited_assessments[edited_assessments["delete"] == True]["id"].tolist()
+            if st.button("🗑️ Delete Selected Exams"):
+                to_delete = edited_exams[edited_exams["delete"] == True]["id"].tolist()
                 if to_delete:
-                    for aid in to_delete:
-                        execute("DELETE FROM assessments WHERE id=? AND user_id=?", (int(aid), user_id))
-                    st.success(f"Deleted {len(to_delete)} assessment(s)!")
+                    for eid in to_delete:
+                        execute("DELETE FROM exams WHERE id=? AND user_id=?", (int(eid), user_id))
+                    st.success(f"Deleted {len(to_delete)} exam(s)!")
                     st.rerun()
+
+    st.divider()
+
+    # ============ ASSESSMENTS EXPANDER ============
+    with st.expander("📋 Assessments", expanded=False):
+        st.caption("Define exams, assignments, projects, and quizzes. Total marks = sum of all assessments.")
+
+        # Ensure default assessment exists
+        ensure_default_assessment(user_id, course_id)
+
+        # Add new assessment form
+        st.write("**Add New Assessment:**")
+        with st.form("add_assessment"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                asmt_name = st.text_input("Assessment name *", placeholder="e.g., Midterm Exam")
+                asmt_type = st.selectbox("Type", ["Exam", "Assignment", "Project", "Quiz", "Other"])
+            with col2:
+                asmt_marks = st.number_input("Marks *", min_value=1, value=50, help="How many marks is this worth?")
+                asmt_due = st.date_input("Due date (optional)", value=None)
+            with col3:
+                asmt_timed = st.checkbox("⏱️ Timed (exam-like)", value=True,
+                                         help="Check for exams/quizzes, uncheck for assignments/projects")
+                asmt_notes = st.text_input("Notes (optional)")
+
+            if st.form_submit_button("➕ Add Assessment", type="primary"):
+                if asmt_name.strip():
+                    execute_returning(
+                        """INSERT INTO assessments(user_id, course_id, assessment_name, assessment_type, marks, due_date, is_timed, notes)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (user_id, course_id, asmt_name.strip(), asmt_type, asmt_marks,
+                         str(asmt_due) if asmt_due else None, 1 if asmt_timed else 0, asmt_notes)
+                    )
+                    st.success(f"Added: {asmt_name} ({asmt_marks} marks)")
+                    st.rerun()
+                else:
+                    st.error("Please enter an assessment name.")
+
+        st.divider()
+
+        # Display existing assessments
+        assessments_df = read_sql("""
+            SELECT id, assessment_name, assessment_type, marks, actual_marks, progress_pct, due_date, is_timed, notes
+            FROM assessments WHERE user_id=? AND course_id=? ORDER BY due_date, id
+        """, (user_id, course_id))
+
+        if not assessments_df.empty:
+            # Calculate completed vs pending
+            completed_count = assessments_df["actual_marks"].notna().sum()
+            total_marks_asmt = assessments_df["marks"].sum()
+            actual_earned_asmt = assessments_df["actual_marks"].fillna(0).sum()
+
+            st.write(f"**Your Assessments ({len(assessments_df)} total, {total_marks_asmt} marks possible):**")
+            if completed_count > 0:
+                st.caption(f"✅ {completed_count} completed — Actual marks earned: **{int(actual_earned_asmt)}**")
+
+            # Convert date for display
+            assessments_df["due_date"] = pd.to_datetime(assessments_df["due_date"], errors="coerce")
+            assessments_df["delete"] = False
+            # Ensure progress_pct has default value
+            if "progress_pct" not in assessments_df.columns:
+                assessments_df["progress_pct"] = 0
+            assessments_df["progress_pct"] = assessments_df["progress_pct"].fillna(0).astype(int)
+
+            edited_assessments = st.data_editor(
+                assessments_df[["id", "assessment_name", "assessment_type", "marks", "actual_marks", "progress_pct", "due_date", "is_timed", "notes", "delete"]],
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", disabled=True),
+                    "assessment_name": st.column_config.TextColumn("Name"),
+                    "assessment_type": st.column_config.SelectboxColumn("Type", options=["Exam", "Assignment", "Project", "Quiz", "Other"]),
+                    "marks": st.column_config.NumberColumn("Max Marks", min_value=1),
+                    "actual_marks": st.column_config.NumberColumn("Actual Marks", min_value=0, help="Enter your score once completed"),
+                    "progress_pct": st.column_config.ProgressColumn("Progress %", format="%d%%", min_value=0, max_value=100, help="Work progress (for assignments)"),
+                    "due_date": st.column_config.DateColumn("Due Date"),
+                    "is_timed": st.column_config.CheckboxColumn("Timed?"),
+                    "notes": st.column_config.TextColumn("Notes"),
+                    "delete": st.column_config.CheckboxColumn("Delete?")
+                },
+                use_container_width=True,
+                hide_index=True,
+                key="assessments_editor"
+            )
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("💾 Save Assessment Changes"):
+                    for _, row in edited_assessments.iterrows():
+                        if not row["delete"]:
+                            due_str = str(row["due_date"].date()) if pd.notna(row["due_date"]) else None
+                            actual = int(row["actual_marks"]) if pd.notna(row["actual_marks"]) else None
+                            progress = int(row["progress_pct"]) if pd.notna(row["progress_pct"]) else 0
+                            execute(
+                                """UPDATE assessments SET assessment_name=?, assessment_type=?, marks=?,
+                                   actual_marks=?, progress_pct=?, due_date=?, is_timed=?, notes=? WHERE id=? AND user_id=?""",
+                                (row["assessment_name"], row["assessment_type"], int(row["marks"]),
+                                 actual, progress, due_str, 1 if row["is_timed"] else 0, row["notes"], int(row["id"]), user_id)
+                            )
+                    st.success("Changes saved!")
+                    st.rerun()
+            with col2:
+                if st.button("🗑️ Delete Selected Assessments"):
+                    to_delete = edited_assessments[edited_assessments["delete"] == True]["id"].tolist()
+                    if to_delete:
+                        for aid in to_delete:
+                            execute("DELETE FROM assessments WHERE id=? AND user_id=?", (int(aid), user_id))
+                        st.success(f"Deleted {len(to_delete)} assessment(s)!")
+                        st.rerun()
         
         # ============ ASSIGNMENT WORK TRACKING ============
         st.divider()
@@ -1644,734 +1739,636 @@ with tabs[1]:
                     use_container_width=True,
                     hide_index=True
                 )
-        else:
-            st.info("💡 Add non-timed assessments (Assignments/Projects) above to track work progress.")
-    else:
-        st.info("No assessments yet. Add your first one above!")
-
-# ============ EXAMS TAB ============
-with tabs[2]:
-    st.subheader("📅 Manage Exams")
-    st.caption("Add multiple exams per course, each with its own marks value.")
-
-    # Show highlight if navigating from empty state
-    if st.session_state.get("navigate_to_exams", False):
-        st.success("👇 **Add your first exam below to start tracking your readiness!**")
-        st.session_state.navigate_to_exams = False
-
-    exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date",
-                        (user_id, course_id))
-    
-    with st.form("add_exam"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            exam_name = st.text_input("Exam name", placeholder="e.g., Midterm, Final Exam")
-        with col2:
-            exam_date_input = st.date_input("Exam date", value=date.today() + timedelta(days=60))
-        with col3:
-            exam_marks = st.number_input("Marks", min_value=1, value=100, help="How many marks is this exam worth?")
-        
-        is_retake_input = st.checkbox("🔄 This is a retake (no lectures)", value=False, 
-                                      help="Retake exams exclude lectures from readiness calculations")
-        
-        if st.form_submit_button("➕ Add Exam", type="primary"):
-            if exam_name.strip():
-                execute_returning("INSERT INTO exams(user_id, course_id, exam_name, exam_date, marks, is_retake) VALUES(?,?,?,?,?,?)",
-                                 (user_id, course_id, exam_name.strip(), str(exam_date_input), exam_marks, 1 if is_retake_input else 0))
-                st.success(f"Exam '{exam_name}' added ({exam_marks} marks)!")
-                st.rerun()
             else:
-                st.error("Please enter an exam name.")
-    
-    if not exams_df.empty:
-        st.divider()
-        
-        # Calculate completed vs pending
-        if "actual_marks" not in exams_df.columns:
-            exams_df["actual_marks"] = None
-        completed_count = exams_df["actual_marks"].notna().sum()
-        total_exam_marks = exams_df["marks"].sum() if "marks" in exams_df.columns else 0
-        actual_earned = exams_df["actual_marks"].fillna(0).sum()
-        
-        st.write(f"**Your Exams ({len(exams_df)} total):**")
-        if completed_count > 0:
-            st.caption(f"✅ {completed_count} completed — Actual marks earned: **{int(actual_earned)}**")
-        
-        exams_df["exam_date"] = pd.to_datetime(exams_df["exam_date"])
-        exams_df["is_retake"] = exams_df["is_retake"].fillna(0).astype(int).apply(lambda x: x == 1)
-        # Handle missing marks column for backward compatibility
-        if "marks" not in exams_df.columns:
-            exams_df["marks"] = 100
-        exams_df["marks"] = exams_df["marks"].fillna(100).astype(int)
-        exams_df["delete"] = False
-        
-        edited_exams = st.data_editor(
-            exams_df[["id", "exam_name", "exam_date", "marks", "actual_marks", "is_retake", "delete"]],
-            column_config={
-                "id": st.column_config.NumberColumn("ID", disabled=True),
-                "exam_name": st.column_config.TextColumn("Exam Name"),
-                "exam_date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
-                "marks": st.column_config.NumberColumn("Max Marks", min_value=1),
-                "actual_marks": st.column_config.NumberColumn("Actual Marks", min_value=0, help="Enter your score once completed"),
-                "is_retake": st.column_config.CheckboxColumn("🔄 Retake"),
-                "delete": st.column_config.CheckboxColumn("Delete?"),
-            },
-            use_container_width=True,
-            hide_index=True,
-            key="exams_editor"
-        )
-        
-        # Summary
-        st.caption(f"📊 Total exam marks: **{total_exam_marks}**")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("💾 Save Exam Changes"):
-                for _, r in edited_exams.iterrows():
-                    if not r.get("delete", False):
-                        actual = int(r["actual_marks"]) if pd.notna(r["actual_marks"]) else None
-                        execute("UPDATE exams SET exam_name=?, exam_date=?, marks=?, actual_marks=?, is_retake=? WHERE id=? AND user_id=?",
-                               (r["exam_name"], pd.to_datetime(r["exam_date"]).strftime("%Y-%m-%d"), 
-                                int(r["marks"]), actual, 1 if r["is_retake"] else 0, int(r["id"]), user_id))
-                st.success("Exams updated!")
-                st.rerun()
-        with col2:
-            if st.button("🗑️ Delete Selected Exams"):
-                to_delete = edited_exams[edited_exams["delete"] == True]["id"].tolist()
-                if to_delete:
-                    for eid in to_delete:
-                        execute("DELETE FROM exams WHERE id=? AND user_id=?", (int(eid), user_id))
-                    st.success(f"Deleted {len(to_delete)} exam(s)!")
+                st.info("💡 Add non-timed assessments (Assignments/Projects) above to track work progress.")
+        else:
+            st.info("No assessments yet. Add your first one above!")
+
+    # ============ TOPICS EXPANDER ============
+    with st.expander("📖 Topics", expanded=False):
+        st.caption("Add topics covered in this course. Weight = expected exam marks for this topic.")
+
+        topics_df_exp = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id",
+                             (user_id, course_id))
+
+        with st.form("add_topic_exp"):
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                topic_name_exp = st.text_input("Topic name", placeholder="e.g., Supply and Demand")
+            with col2:
+                weight_exp = st.number_input("Weight (points)", min_value=0, value=10)
+
+            if st.form_submit_button("➕ Add Topic"):
+                if topic_name_exp.strip():
+                    execute_returning("INSERT INTO topics(user_id, course_id, topic_name, weight_points) VALUES(?,?,?,?)",
+                                     (user_id, course_id, topic_name_exp.strip(), weight_exp))
+                    st.success("Topic added!")
                     st.rerun()
-    else:
-        st.info("No exams added yet. Add your first exam above!")
 
-# ============ TOPICS TAB ============
-with tabs[3]:
-    st.subheader("📖 Manage Topics")
-    
-    topics_df = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id", 
-                         (user_id, course_id))
-    
-    with st.form("add_topic"):
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            topic_name = st.text_input("Topic name", placeholder="e.g., Supply and Demand")
-        with col2:
-            weight = st.number_input("Weight (points)", min_value=0, value=10)
-        
-        if st.form_submit_button("➕ Add Topic"):
-            if topic_name.strip():
-                execute_returning("INSERT INTO topics(user_id, course_id, topic_name, weight_points) VALUES(?,?,?,?)",
-                                 (user_id, course_id, topic_name.strip(), weight))
-                st.success("Topic added!")
-                st.rerun()
-    
-    if not topics_df.empty:
-        st.write("**Existing Topics:**")
-        edited_topics = st.data_editor(
-            topics_df,
-            column_config={
-                "id": st.column_config.NumberColumn("ID", disabled=True),
-                "topic_name": st.column_config.TextColumn("Topic Name", width="large"),
-                "weight_points": st.column_config.NumberColumn("Weight", min_value=0),
-                "notes": st.column_config.TextColumn("Notes"),
-            },
-            use_container_width=True,
-            hide_index=True,
-            key="topics_editor"
-        )
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("💾 Save Topic Changes"):
-                for _, r in edited_topics.iterrows():
-                    if pd.notna(r["id"]):
-                        execute("UPDATE topics SET topic_name=?, weight_points=?, notes=? WHERE id=? AND user_id=?",
-                               (r["topic_name"], float(r["weight_points"]), r.get("notes"), int(r["id"]), user_id))
-                st.success("Topics updated!")
-                st.rerun()
-        with col2:
-            topic_to_delete = st.selectbox("Delete topic", topics_df["topic_name"].tolist(), key="del_topic")
-            if st.button("🗑️ Delete Selected Topic"):
-                topic_id_del = topics_df.loc[topics_df["topic_name"] == topic_to_delete, "id"].iloc[0]
-                execute("DELETE FROM study_sessions WHERE topic_id=?", (int(topic_id_del),))
-                execute("DELETE FROM exercises WHERE topic_id=?", (int(topic_id_del),))
-                execute("DELETE FROM topics WHERE id=? AND user_id=?", (int(topic_id_del), user_id))
-                st.success("Topic and related data deleted!")
-                st.rerun()
+        if not topics_df_exp.empty:
+            st.write("**Existing Topics:**")
+            edited_topics = st.data_editor(
+                topics_df_exp,
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", disabled=True),
+                    "topic_name": st.column_config.TextColumn("Topic Name", width="large"),
+                    "weight_points": st.column_config.NumberColumn("Weight", min_value=0),
+                    "notes": st.column_config.TextColumn("Notes"),
+                },
+                use_container_width=True,
+                hide_index=True,
+                key="topics_editor"
+            )
 
-# ============ IMPORT TOPICS TAB ============
-with tabs[4]:
-    st.subheader("📥 Import Topics from PDF")
-    st.caption("Upload lecture slide PDFs to automatically extract topic names.")
-    
-    if not HAS_PYMUPDF:
-        st.error("⚠️ PDF extraction requires PyMuPDF. Install with: `pip install pymupdf`")
-    else:
-        # Initialize session state for imported topics
-        if "imported_topics" not in st.session_state:
-            st.session_state.imported_topics = None
-        if "import_stats" not in st.session_state:
-            st.session_state.import_stats = None
-        
-        # File uploader
-        st.write("**Step 1: Upload PDF Files**")
-        uploaded_files = st.file_uploader(
-            "Select lecture slide PDFs",
-            type=["pdf"],
-            accept_multiple_files=True,
-            help="Upload one or more PDF files containing lecture slides"
-        )
-        
-        if uploaded_files:
-            st.caption(f"📎 {len(uploaded_files)} file(s) selected")
-            
-            # Extract topics button
-            if st.button("🔍 Extract Topics", type="primary"):
-                with st.spinner("Extracting topics from PDFs..."):
-                    pdf_files = [(f.read(), f.name) for f in uploaded_files]
-                    # Reset file pointers
-                    for f in uploaded_files:
-                        f.seek(0)
-                    
-                    try:
-                        candidates, stats = extract_and_process_topics(pdf_files)
-                        st.session_state.imported_topics = candidates
-                        st.session_state.import_stats = stats
-                        st.success(f"✅ Extraction complete!")
-                    except Exception as e:
-                        st.error(f"Error extracting topics: {e}")
-                        st.session_state.imported_topics = None
-        
-        # Show extraction results
-        if st.session_state.imported_topics is not None:
-            stats = st.session_state.import_stats
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("💾 Save Topic Changes"):
+                    for _, r in edited_topics.iterrows():
+                        if pd.notna(r["id"]):
+                            execute("UPDATE topics SET topic_name=?, weight_points=?, notes=? WHERE id=? AND user_id=?",
+                                   (r["topic_name"], float(r["weight_points"]), r.get("notes"), int(r["id"]), user_id))
+                    st.success("Topics updated!")
+                    st.rerun()
+            with col2:
+                topic_to_delete = st.selectbox("Delete topic", topics_df_exp["topic_name"].tolist(), key="del_topic")
+                if st.button("🗑️ Delete Selected Topic"):
+                    topic_id_del = topics_df_exp.loc[topics_df_exp["topic_name"] == topic_to_delete, "id"].iloc[0]
+                    execute("DELETE FROM study_sessions WHERE topic_id=?", (int(topic_id_del),))
+                    execute("DELETE FROM exercises WHERE topic_id=?", (int(topic_id_del),))
+                    execute("DELETE FROM topics WHERE id=? AND user_id=?", (int(topic_id_del), user_id))
+                    st.success("Topic and related data deleted!")
+                    st.rerun()
 
-            st.divider()
-            st.write("**Extraction Summary:**")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Files Processed", stats["files_processed"])
-            col2.metric("Pages Scanned", stats["total_pages"])
-            col3.metric("Topics Found", stats.get("final_topics", stats.get("final_candidates", 0)))
-            col4.metric("Adaptive Cap", stats.get("adaptive_cap", "N/A"))
+    # ============ IMPORT TOPICS EXPANDER ============
+    with st.expander("📥 Import Topics from PDF", expanded=False):
+        st.caption("Upload lecture slide PDFs to automatically extract topic names.")
 
-            # Detailed extraction pipeline stats
-            with st.expander("📊 Extraction Pipeline Details"):
-                st.caption("How topics were filtered at each stage:")
-                st.write(f"1. **Raw candidates extracted:** {stats.get('raw_candidates', stats.get('initial_candidates', 0))}")
-                st.write(f"2. **After header filter (>10% of pages removed):** {stats.get('after_header_filter', 'N/A')}")
-                st.write(f"3. **After frequency filter (min 2 or 3% pages):** {stats.get('after_frequency_filter', 'N/A')}")
-                st.write(f"4. **After similarity clustering (90% threshold):** {stats.get('after_clustering', 'N/A')}")
-                st.write(f"5. **After hierarchical merge:** {stats.get('after_hierarchical_merge', 'N/A')}")
-                st.write(f"6. **Final topics (ranked & capped):** {stats.get('final_topics', stats.get('final_candidates', 0))}")
+        if not HAS_PYMUPDF:
+            st.error("⚠️ PDF extraction requires PyMuPDF. Install with: `pip install pymupdf`")
+        else:
+            # Initialize session state for imported topics
+            if "imported_topics" not in st.session_state:
+                st.session_state.imported_topics = None
+            if "import_stats" not in st.session_state:
+                st.session_state.import_stats = None
 
-                reduction_pct = 0
-                initial = stats.get('raw_candidates', stats.get('initial_candidates', 0))
-                final = stats.get('final_topics', stats.get('final_candidates', 0))
-                if initial > 0:
-                    reduction_pct = round((1 - final / initial) * 100, 1)
-                st.success(f"✅ Reduced by {reduction_pct}% ({initial} → {final} topics)")
+            # File uploader
+            st.write("**Step 1: Upload PDF Files**")
+            uploaded_files = st.file_uploader(
+                "Select lecture slide PDFs",
+                type=["pdf"],
+                accept_multiple_files=True,
+                help="Upload one or more PDF files containing lecture slides"
+            )
 
-            # Show subtopics if available
-            if stats.get("subtopics") and len(stats["subtopics"]) > 0:
-                show_subtopics = st.checkbox(
-                    f"🔍 Show {len(stats['subtopics'])} subtopic(s) that were merged into parent topics",
-                    value=False
-                )
-                if show_subtopics:
-                    st.caption("These topics were merged hierarchically (e.g., 'Topic I: Part A' → 'Topic')")
-                    subtopics_df = pd.DataFrame(stats["subtopics"])
-                    st.dataframe(
-                        subtopics_df[["topic_name", "parent_topic"]],
-                        use_container_width=True,
-                        hide_index=True
-                    )
+            if uploaded_files:
+                st.caption(f"📎 {len(uploaded_files)} file(s) selected")
 
-            st.divider()
-            st.write("**Step 2: Review & Edit Topics**")
-            st.caption("Check topics to include, edit names as needed.")
-            
-            # Convert to DataFrame for editing
-            if st.session_state.imported_topics:
-                import_df = pd.DataFrame(st.session_state.imported_topics)
-                import_df["include"] = True
+                # Extract topics button
+                if st.button("🔍 Extract Topics", type="primary"):
+                    with st.spinner("Extracting topics from PDFs..."):
+                        pdf_files = [(f.read(), f.name) for f in uploaded_files]
+                        # Reset file pointers
+                        for f in uploaded_files:
+                            f.seek(0)
 
-                # Handle both old (confidence) and new (occurrence_count) format
-                if "occurrence_count" in import_df.columns:
-                    import_df["frequency"] = import_df["occurrence_count"]
-                elif "confidence" in import_df.columns:
-                    import_df["frequency"] = import_df["confidence"].round(2)
-                else:
-                    import_df["frequency"] = 1
+                        try:
+                            candidates, stats = extract_and_process_topics(pdf_files)
+                            st.session_state.imported_topics = candidates
+                            st.session_state.import_stats = stats
+                            st.success(f"✅ Extraction complete!")
+                        except Exception as e:
+                            st.error(f"Error extracting topics: {e}")
+                            st.session_state.imported_topics = None
 
-                # Get existing topics to check for duplicates
-                existing_topics = read_sql(
-                    "SELECT topic_name FROM topics WHERE user_id=? AND course_id=?",
-                    (user_id, course_id)
-                )
-                existing_normalized = set(normalize_text(t) for t in existing_topics["topic_name"].tolist()) if not existing_topics.empty else set()
+            # Show extraction results
+            if st.session_state.imported_topics is not None:
+                stats = st.session_state.import_stats
 
-                # Mark duplicates
-                import_df["is_duplicate"] = import_df["topic_name"].apply(
-                    lambda x: normalize_text(x) in existing_normalized
-                )
-                import_df.loc[import_df["is_duplicate"], "include"] = False
-
-                # Select columns for display
-                display_cols = ["include", "topic_name", "source_file", "frequency", "is_duplicate"]
-                if "has_subtopics" in import_df.columns:
-                    import_df["subtopics"] = import_df.apply(
-                        lambda row: f"✓ ({row['num_subtopics']})" if row.get("has_subtopics") else "",
-                        axis=1
-                    )
-                    display_cols.insert(4, "subtopics")
-
-                edited_imports = st.data_editor(
-                    import_df[display_cols],
-                    column_config={
-                        "include": st.column_config.CheckboxColumn("Include", default=True),
-                        "topic_name": st.column_config.TextColumn("Topic Name"),
-                        "source_file": st.column_config.TextColumn("Source File", disabled=True),
-                        "frequency": st.column_config.NumberColumn("Frequency", help="Number of times this topic appears", disabled=True),
-                        "subtopics": st.column_config.TextColumn("Has Subtopics?", disabled=True),
-                        "is_duplicate": st.column_config.CheckboxColumn("Already Exists?", disabled=True)
-                    },
-                    use_container_width=True,
-                    hide_index=True,
-                    key="import_topics_editor"
-                )
-                
-                # Count selections
-                selected_count = edited_imports["include"].sum()
-                duplicate_count = edited_imports["is_duplicate"].sum()
-                
-                if duplicate_count > 0:
-                    st.warning(f"⚠️ {duplicate_count} topic(s) already exist in this course and are unchecked.")
-                
-                st.write(f"**Selected: {selected_count} topic(s)**")
-                
                 st.divider()
-                st.write("**Step 3: Create Topics**")
-                
-                if st.button(f"✅ Create {selected_count} Topics", type="primary", disabled=selected_count == 0):
-                    created = 0
-                    skipped = 0
-                    
-                    # Get existing normalized topics again for final check
-                    existing_topics = read_sql(
+                st.write("**Extraction Summary:**")
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Files Processed", stats["files_processed"])
+                col2.metric("Pages Scanned", stats["total_pages"])
+                col3.metric("Topics Found", stats.get("final_topics", stats.get("final_candidates", 0)))
+                col4.metric("Adaptive Cap", stats.get("adaptive_cap", "N/A"))
+
+                # Detailed extraction pipeline stats
+                with st.expander("📊 Extraction Pipeline Details"):
+                    st.caption("How topics were filtered at each stage:")
+                    st.write(f"1. **Raw candidates extracted:** {stats.get('raw_candidates', stats.get('initial_candidates', 0))}")
+                    st.write(f"2. **After header filter (>10% of pages removed):** {stats.get('after_header_filter', 'N/A')}")
+                    st.write(f"3. **After frequency filter (min 2 or 3% pages):** {stats.get('after_frequency_filter', 'N/A')}")
+                    st.write(f"4. **After similarity clustering (90% threshold):** {stats.get('after_clustering', 'N/A')}")
+                    st.write(f"5. **After hierarchical merge:** {stats.get('after_hierarchical_merge', 'N/A')}")
+                    st.write(f"6. **Final topics (ranked & capped):** {stats.get('final_topics', stats.get('final_candidates', 0))}")
+
+                    reduction_pct = 0
+                    initial = stats.get('raw_candidates', stats.get('initial_candidates', 0))
+                    final = stats.get('final_topics', stats.get('final_candidates', 0))
+                    if initial > 0:
+                        reduction_pct = round((1 - final / initial) * 100, 1)
+                    st.success(f"✅ Reduced by {reduction_pct}% ({initial} → {final} topics)")
+
+                # Show subtopics if available
+                if stats.get("subtopics") and len(stats["subtopics"]) > 0:
+                    show_subtopics = st.checkbox(
+                        f"🔍 Show {len(stats['subtopics'])} subtopic(s) that were merged into parent topics",
+                        value=False
+                    )
+                    if show_subtopics:
+                        st.caption("These topics were merged hierarchically (e.g., 'Topic I: Part A' → 'Topic')")
+                        subtopics_df = pd.DataFrame(stats["subtopics"])
+                        st.dataframe(
+                            subtopics_df[["topic_name", "parent_topic"]],
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                st.divider()
+                st.write("**Step 2: Review & Edit Topics**")
+                st.caption("Check topics to include, edit names as needed.")
+
+                # Convert to DataFrame for editing
+                if st.session_state.imported_topics:
+                    import_df = pd.DataFrame(st.session_state.imported_topics)
+                    import_df["include"] = True
+
+                    # Handle both old (confidence) and new (occurrence_count) format
+                    if "occurrence_count" in import_df.columns:
+                        import_df["frequency"] = import_df["occurrence_count"]
+                    elif "confidence" in import_df.columns:
+                        import_df["frequency"] = import_df["confidence"].round(2)
+                    else:
+                        import_df["frequency"] = 1
+
+                    # Get existing topics to check for duplicates
+                    existing_topics_imp = read_sql(
                         "SELECT topic_name FROM topics WHERE user_id=? AND course_id=?",
                         (user_id, course_id)
                     )
-                    existing_normalized = set(normalize_text(t) for t in existing_topics["topic_name"].tolist()) if not existing_topics.empty else set()
-                    
-                    for _, row in edited_imports.iterrows():
-                        if not row["include"]:
-                            continue
-                        
-                        topic_name = row["topic_name"].strip()
-                        normalized = normalize_text(topic_name)
-                        
-                        # Skip if already exists
-                        if normalized in existing_normalized:
-                            skipped += 1
-                            continue
-                        
-                        # Insert topic
-                        execute_returning(
-                            "INSERT INTO topics(user_id, course_id, topic_name, weight_points, notes) VALUES(?,?,?,?,?)",
-                            (user_id, course_id, topic_name, 0, f"Imported from: {row['source_file']}")
+                    existing_normalized = set(normalize_text(t) for t in existing_topics_imp["topic_name"].tolist()) if not existing_topics_imp.empty else set()
+
+                    # Mark duplicates
+                    import_df["is_duplicate"] = import_df["topic_name"].apply(
+                        lambda x: normalize_text(x) in existing_normalized
+                    )
+                    import_df.loc[import_df["is_duplicate"], "include"] = False
+
+                    # Select columns for display
+                    display_cols = ["include", "topic_name", "source_file", "frequency", "is_duplicate"]
+                    if "has_subtopics" in import_df.columns:
+                        import_df["subtopics"] = import_df.apply(
+                            lambda row: f"✓ ({row['num_subtopics']})" if row.get("has_subtopics") else "",
+                            axis=1
                         )
-                        existing_normalized.add(normalized)
-                        created += 1
-                    
-                    # Clear session state
+                        display_cols.insert(4, "subtopics")
+
+                    edited_imports = st.data_editor(
+                        import_df[display_cols],
+                        column_config={
+                            "include": st.column_config.CheckboxColumn("Include", default=True),
+                            "topic_name": st.column_config.TextColumn("Topic Name"),
+                            "source_file": st.column_config.TextColumn("Source File", disabled=True),
+                            "frequency": st.column_config.NumberColumn("Frequency", help="Number of times this topic appears", disabled=True),
+                            "subtopics": st.column_config.TextColumn("Has Subtopics?", disabled=True),
+                            "is_duplicate": st.column_config.CheckboxColumn("Already Exists?", disabled=True)
+                        },
+                        use_container_width=True,
+                        hide_index=True,
+                        key="import_topics_editor"
+                    )
+
+                    # Count selections
+                    selected_count = edited_imports["include"].sum()
+                    duplicate_count = edited_imports["is_duplicate"].sum()
+
+                    if duplicate_count > 0:
+                        st.warning(f"⚠️ {duplicate_count} topic(s) already exist in this course and are unchecked.")
+
+                    st.write(f"**Selected: {selected_count} topic(s)**")
+
+                    st.divider()
+                    st.write("**Step 3: Create Topics**")
+
+                    if st.button(f"✅ Create {selected_count} Topics", type="primary", disabled=selected_count == 0):
+                        created = 0
+                        skipped = 0
+
+                        # Get existing normalized topics again for final check
+                        existing_topics_imp = read_sql(
+                            "SELECT topic_name FROM topics WHERE user_id=? AND course_id=?",
+                            (user_id, course_id)
+                        )
+                        existing_normalized = set(normalize_text(t) for t in existing_topics_imp["topic_name"].tolist()) if not existing_topics_imp.empty else set()
+
+                        for _, row in edited_imports.iterrows():
+                            if not row["include"]:
+                                continue
+
+                            topic_name_imp = row["topic_name"].strip()
+                            normalized = normalize_text(topic_name_imp)
+
+                            # Skip if already exists
+                            if normalized in existing_normalized:
+                                skipped += 1
+                                continue
+
+                            # Insert topic
+                            execute_returning(
+                                "INSERT INTO topics(user_id, course_id, topic_name, weight_points, notes) VALUES(?,?,?,?,?)",
+                                (user_id, course_id, topic_name_imp, 0, f"Imported from: {row['source_file']}")
+                            )
+                            existing_normalized.add(normalized)
+                            created += 1
+
+                        # Clear session state
+                        st.session_state.imported_topics = None
+                        st.session_state.import_stats = None
+
+                        if created > 0:
+                            st.success(f"✅ Created {created} new topic(s)!")
+                        if skipped > 0:
+                            st.info(f"ℹ️ Skipped {skipped} duplicate(s).")
+
+                        st.info("💡 Expand Topics above to set weight points for your new topics.")
+                        st.rerun()
+                else:
+                    st.info("No topics were extracted. Try uploading different PDF files.")
+
+                # Clear button
+                if st.button("🔄 Clear & Start Over"):
                     st.session_state.imported_topics = None
                     st.session_state.import_stats = None
-                    
-                    if created > 0:
-                        st.success(f"✅ Created {created} new topic(s)!")
-                    if skipped > 0:
-                        st.info(f"ℹ️ Skipped {skipped} duplicate(s).")
-                    
-                    st.info("💡 Go to the Topics tab to set weight points for your new topics.")
                     st.rerun()
-            else:
-                st.info("No topics were extracted. Try uploading different PDF files.")
-            
-            # Clear button
-            if st.button("🔄 Clear & Start Over"):
-                st.session_state.imported_topics = None
-                st.session_state.import_stats = None
-                st.rerun()
 
-# ============ STUDY SESSIONS TAB ============
-with tabs[5]:
-    st.subheader("✏️ Study Sessions")
-    st.caption("Log when you review/study a topic. Quality: 1=distracted, 3=normal, 5=deep focus")
-    
-    topics_df = read_sql("SELECT id, topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name", 
-                         (user_id, course_id))
-    
-    if topics_df.empty:
-        st.warning("Add topics first!")
-    else:
-        with st.form("study_form"):
-            topic_options = topics_df["topic_name"].tolist()
-            selected_topic = st.selectbox("Topic studied", topic_options)
-            topic_id = int(topics_df.loc[topics_df["topic_name"] == selected_topic, "id"].iloc[0])
-            
+# ============ STUDY TAB ============
+# Contains: Study Sessions, Exercises, Timed Attempts, Lecture Calendar, Export
+with tabs[2]:
+    st.subheader("📚 Study & Practice")
+    st.caption("Log study sessions, exercises, timed attempts, and manage lectures.")
+
+    # ============ STUDY SESSIONS EXPANDER ============
+    with st.expander("✏️ Study Sessions", expanded=True):
+        st.caption("Log when you review/study a topic. Quality: 1=distracted, 3=normal, 5=deep focus")
+
+        topics_df_study = read_sql("SELECT id, topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name",
+                             (user_id, course_id))
+
+        if topics_df_study.empty:
+            st.warning("Add topics first!")
+        else:
+            with st.form("study_form"):
+                topic_options_study = topics_df_study["topic_name"].tolist()
+                selected_topic_study = st.selectbox("Topic studied", topic_options_study)
+                topic_id_study = int(topics_df_study.loc[topics_df_study["topic_name"] == selected_topic_study, "id"].iloc[0])
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    study_date = st.date_input("Date", value=date.today(), key="study_date")
+                with col2:
+                    duration = st.number_input("Duration (mins)", min_value=5, value=30, step=5)
+                with col3:
+                    quality = st.slider("Quality (1-5)", min_value=1, max_value=5, value=3)
+
+                notes_study = st.text_area("Notes (optional)", key="study_notes")
+
+                if st.form_submit_button("📝 Save Study Session"):
+                    execute_returning("INSERT INTO study_sessions(topic_id, session_date, duration_mins, quality, notes) VALUES(?,?,?,?,?)",
+                                     (topic_id_study, str(study_date), duration, quality, notes_study))
+                    st.success("Study session logged!")
+                    st.rerun()
+
+            st.write("**Recent Study Sessions:**")
+            sessions_df = read_sql("""
+                SELECT s.id, t.topic_name, s.session_date, s.duration_mins, s.quality, s.notes
+                FROM study_sessions s
+                JOIN topics t ON s.topic_id = t.id
+                WHERE t.user_id = ? AND t.course_id = ?
+                ORDER BY s.session_date DESC
+                LIMIT 30
+            """, (user_id, course_id))
+
+            if not sessions_df.empty:
+                sessions_df["delete"] = False
+                edited_sessions = st.data_editor(
+                    sessions_df,
+                    column_config={
+                        "id": st.column_config.NumberColumn("ID", disabled=True),
+                        "delete": st.column_config.CheckboxColumn("🗑️ Delete", default=False),
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                    key="sessions_editor"
+                )
+
+                if st.button("🗑️ Delete Selected Sessions"):
+                    to_delete = edited_sessions[edited_sessions["delete"] == True]["id"].tolist()
+                    if to_delete:
+                        for sid in to_delete:
+                            execute("DELETE FROM study_sessions WHERE id=?", (int(sid),))
+                        st.success(f"Deleted {len(to_delete)} session(s)!")
+                        st.rerun()
+
+    # ============ EXERCISES EXPANDER ============
+    with st.expander("🏋️ Exercises", expanded=False):
+        st.caption("Log practice questions/exercises completed for a topic.")
+
+        topics_df_ex = read_sql("SELECT id, topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name",
+                             (user_id, course_id))
+
+        if topics_df_ex.empty:
+            st.warning("Add topics first!")
+        else:
+            with st.form("exercise_form"):
+                topic_options_ex = topics_df_ex["topic_name"].tolist()
+                selected_topic_ex = st.selectbox("Topic", topic_options_ex)
+                topic_id_ex = int(topics_df_ex.loc[topics_df_ex["topic_name"] == selected_topic_ex, "id"].iloc[0])
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    ex_date = st.date_input("Date", value=date.today(), key="ex_date")
+                with col2:
+                    total_q = st.number_input("Total questions", min_value=1, value=10)
+                with col3:
+                    correct = st.number_input("Correct answers", min_value=0, max_value=100, value=10)
+
+                source_ex = st.text_input("Source (optional)", placeholder="e.g., 2023 Past Paper", key="ex_source")
+                notes_ex = st.text_area("Notes (optional)", key="ex_notes")
+
+                if st.form_submit_button("💪 Save Exercises"):
+                    execute_returning("INSERT INTO exercises(topic_id, exercise_date, total_questions, correct_answers, source, notes) VALUES(?,?,?,?,?,?)",
+                                     (topic_id_ex, str(ex_date), total_q, min(correct, total_q), source_ex, notes_ex))
+                    st.success(f"Logged {min(correct, total_q)}/{total_q} correct!")
+                    st.rerun()
+
+            st.write("**Recent Exercises:**")
+            exercises_df = read_sql("""
+                SELECT e.id, t.topic_name, e.exercise_date, e.total_questions, e.correct_answers, e.source
+                FROM exercises e
+                JOIN topics t ON e.topic_id = t.id
+                WHERE t.user_id = ? AND t.course_id = ?
+                ORDER BY e.exercise_date DESC
+                LIMIT 30
+            """, (user_id, course_id))
+
+            if not exercises_df.empty:
+                exercises_df["score"] = (exercises_df["correct_answers"] / exercises_df["total_questions"] * 100).round(0).astype(int).astype(str) + "%"
+                exercises_df["delete"] = False
+
+                edited_exercises = st.data_editor(
+                    exercises_df,
+                    column_config={
+                        "id": st.column_config.NumberColumn("ID", disabled=True),
+                        "delete": st.column_config.CheckboxColumn("🗑️ Delete", default=False),
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                    key="exercises_editor"
+                )
+
+                if st.button("🗑️ Delete Selected Exercises"):
+                    to_delete = edited_exercises[edited_exercises["delete"] == True]["id"].tolist()
+                    if to_delete:
+                        for eid in to_delete:
+                            execute("DELETE FROM exercises WHERE id=?", (int(eid),))
+                        st.success(f"Deleted {len(to_delete)} exercise(s)!")
+                        st.rerun()
+
+    # ============ TIMED ATTEMPTS EXPANDER ============
+    with st.expander("⏱️ Timed Attempts", expanded=False):
+        st.caption("Log timed past-paper or practice exam attempts. Performance on specific topics boosts your readiness predictions.")
+
+        # Get topics for multi-select
+        topics_df_ta = read_sql("SELECT topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name",
+                                (user_id, course_id))
+        topic_names_ta = topics_df_ta["topic_name"].tolist() if not topics_df_ta.empty else []
+
+        st.write("**Log New Attempt:**")
+        with st.form("timed_attempt_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                ta_date = st.date_input("Attempt date", value=date.today(), key="ta_date")
+                ta_source = st.text_input("Source", placeholder="e.g., 2023 Past Paper, Mock Exam 1")
+            with col2:
+                ta_minutes = st.number_input("Duration (minutes)", min_value=1, value=60)
+                ta_score = st.slider("Score (%)", min_value=0, max_value=100, value=70, help="Your percentage score on this attempt")
+
+            if topic_names_ta:
+                ta_topics = st.multiselect("Topics covered in this attempt", topic_names_ta,
+                                           help="Select all topics that were tested in this paper/exam")
+            else:
+                ta_topics = []
+                st.warning("Add topics first to tag them in your attempts.")
+
+            ta_notes = st.text_area("Notes (optional)", placeholder="e.g., Struggled with Q3, ran out of time on last section", key="ta_notes")
+
+            if st.form_submit_button("📝 Log Attempt", type="primary"):
+                if ta_source.strip():
+                    topics_str = ", ".join(ta_topics) if ta_topics else ""
+                    execute_returning(
+                        "INSERT INTO timed_attempts(user_id, course_id, attempt_date, source, minutes, score_pct, topics, notes) VALUES(?,?,?,?,?,?,?,?)",
+                        (user_id, course_id, str(ta_date), ta_source.strip(), ta_minutes, ta_score / 100.0, topics_str, ta_notes)
+                    )
+                    st.success("Attempt logged! Your readiness predictions have been updated.")
+                    st.rerun()
+                else:
+                    st.error("Please enter a source for this attempt.")
+
+        st.divider()
+
+        # Display existing timed attempts
+        timed_df = read_sql("""
+            SELECT id, attempt_date, source, minutes, score_pct, topics, notes
+            FROM timed_attempts
+            WHERE user_id=? AND course_id=?
+            ORDER BY attempt_date DESC
+        """, (user_id, course_id))
+
+        if not timed_df.empty:
+            st.write(f"**Your Timed Attempts ({len(timed_df)} total):**")
+
+            # Convert date column to datetime for data_editor compatibility
+            timed_df["attempt_date"] = pd.to_datetime(timed_df["attempt_date"], errors="coerce")
+
+            # Add delete column
+            timed_df["delete"] = False
+            timed_df["score_pct"] = (timed_df["score_pct"] * 100).round(0).astype(int)
+
+            edited_timed = st.data_editor(
+                timed_df[["id", "attempt_date", "source", "minutes", "score_pct", "topics", "notes", "delete"]],
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", disabled=True),
+                    "attempt_date": st.column_config.DateColumn("Date"),
+                    "source": st.column_config.TextColumn("Source"),
+                    "minutes": st.column_config.NumberColumn("Mins", min_value=1),
+                    "score_pct": st.column_config.ProgressColumn("Score %", format="%d%%", min_value=0, max_value=100),
+                    "topics": st.column_config.TextColumn("Topics Covered"),
+                    "notes": st.column_config.TextColumn("Notes"),
+                    "delete": st.column_config.CheckboxColumn("Delete?")
+                },
+                use_container_width=True,
+                hide_index=True,
+                key="timed_attempts_editor"
+            )
+
+            if st.button("🗑️ Delete Selected Attempts"):
+                to_delete = edited_timed[edited_timed["delete"] == True]["id"].tolist()
+                if to_delete:
+                    for tid in to_delete:
+                        execute("DELETE FROM timed_attempts WHERE id=? AND user_id=?", (int(tid), user_id))
+                    st.success(f"Deleted {len(to_delete)} attempt(s)!")
+                    st.rerun()
+
+            # Stats summary
+            st.divider()
+            st.write("**Performance Summary:**")
             col1, col2, col3 = st.columns(3)
             with col1:
-                study_date = st.date_input("Date", value=date.today())
+                avg_score = timed_df["score_pct"].mean()
+                st.metric("Average Score", f"{avg_score:.0f}%")
             with col2:
-                duration = st.number_input("Duration (mins)", min_value=5, value=30, step=5)
+                total_mins = timed_df["minutes"].sum()
+                st.metric("Total Practice Time", f"{total_mins // 60}h {total_mins % 60}m")
             with col3:
-                quality = st.slider("Quality (1-5)", min_value=1, max_value=5, value=3)
-            
-            notes = st.text_area("Notes (optional)")
-            
-            if st.form_submit_button("📝 Save Study Session"):
-                execute_returning("INSERT INTO study_sessions(topic_id, session_date, duration_mins, quality, notes) VALUES(?,?,?,?,?)",
-                                 (topic_id, str(study_date), duration, quality, notes))
-                st.success("Study session logged!")
+                recent_count = len(timed_df[pd.to_datetime(timed_df["attempt_date"]).dt.date >= (date.today() - timedelta(days=14))])
+                st.metric("Last 14 Days", f"{recent_count} attempts")
+        else:
+            st.info("No timed attempts logged yet. Log your first practice exam above!")
+
+    # ============ LECTURE CALENDAR EXPANDER ============
+    with st.expander("🎓 Lecture Calendar", expanded=False):
+        st.caption("Schedule lectures and track attendance. Topics in lectures boost mastery when attended.")
+
+        topics_df_lec = read_sql("SELECT topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name",
+                             (user_id, course_id))
+        topic_names_lec = topics_df_lec["topic_name"].tolist() if not topics_df_lec.empty else []
+
+        st.write("**Schedule New Lecture:**")
+        with st.form("lecture_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                l_date = st.date_input("Lecture date", value=date.today(), key="lec_date")
+            with col2:
+                l_time = st.text_input("Time (optional)", placeholder="e.g., 10:00 AM")
+
+            topics_planned = st.text_input("Topics to be covered (comma separated)",
+                                           placeholder=", ".join(topic_names_lec[:3]) if topic_names_lec else "e.g., Topic A, Topic B")
+            notes_lec = st.text_area("Notes (optional)", key="lec_notes")
+
+            if st.form_submit_button("📅 Schedule Lecture"):
+                execute_returning("INSERT INTO scheduled_lectures(user_id, course_id, lecture_date, lecture_time, topics_planned, notes) VALUES(?,?,?,?,?,?)",
+                                 (user_id, course_id, str(l_date), l_time, topics_planned, notes_lec))
+                st.success("Lecture scheduled!")
                 st.rerun()
-        
-        st.subheader("Recent Study Sessions")
-        sessions_df = read_sql("""
-            SELECT s.id, t.topic_name, s.session_date, s.duration_mins, s.quality, s.notes
-            FROM study_sessions s
+
+        lectures_df = read_sql("""
+            SELECT * FROM scheduled_lectures
+            WHERE user_id=? AND course_id=?
+            ORDER BY lecture_date
+        """, (user_id, course_id))
+
+        if not lectures_df.empty:
+            today_lec = date.today()
+
+            lectures_df["lecture_date_parsed"] = pd.to_datetime(lectures_df["lecture_date"])
+            upcoming = lectures_df[lectures_df["lecture_date_parsed"].dt.date >= today_lec].copy()
+            past = lectures_df[lectures_df["lecture_date_parsed"].dt.date < today_lec].copy()
+
+            st.write("**📅 Upcoming Lectures:**")
+            if not upcoming.empty:
+                upcoming["attended"] = upcoming["attended"].fillna(0).astype(int)
+                upcoming_display = upcoming[["id", "lecture_date", "lecture_time", "topics_planned", "notes"]].copy()
+                upcoming_display["lecture_date"] = pd.to_datetime(upcoming_display["lecture_date"])
+
+                edited_upcoming = st.data_editor(
+                    upcoming_display,
+                    column_config={
+                        "id": st.column_config.NumberColumn("ID", disabled=True),
+                        "lecture_date": st.column_config.DateColumn("Date", format="ddd DD/MM"),
+                        "lecture_time": st.column_config.TextColumn("Time"),
+                        "topics_planned": st.column_config.TextColumn("Topics"),
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                    key="upcoming_lectures"
+                )
+
+                if st.button("💾 Save Upcoming Lecture Changes"):
+                    for _, r in edited_upcoming.iterrows():
+                        execute("UPDATE scheduled_lectures SET lecture_date=?, lecture_time=?, topics_planned=?, notes=? WHERE id=? AND user_id=?",
+                               (pd.to_datetime(r["lecture_date"]).strftime("%Y-%m-%d"), r["lecture_time"], r["topics_planned"], r.get("notes"), int(r["id"]), user_id))
+                    st.success("Updated!")
+                    st.rerun()
+            else:
+                st.info("No upcoming lectures scheduled.")
+
+            st.write("**📋 Past Lectures (mark attendance):**")
+            if not past.empty:
+                past["attended"] = past["attended"].apply(lambda x: True if x == 1 else False)
+                past_display = past[["id", "lecture_date", "lecture_time", "topics_planned", "attended"]].copy()
+                past_display["lecture_date"] = pd.to_datetime(past_display["lecture_date"])
+
+                edited_past = st.data_editor(
+                    past_display,
+                    column_config={
+                        "id": st.column_config.NumberColumn("ID", disabled=True),
+                        "lecture_date": st.column_config.DateColumn("Date", format="ddd DD/MM", disabled=True),
+                        "lecture_time": st.column_config.TextColumn("Time", disabled=True),
+                        "topics_planned": st.column_config.TextColumn("Topics", disabled=True),
+                        "attended": st.column_config.CheckboxColumn("✅ Attended"),
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                    key="past_lectures"
+                )
+
+                if st.button("💾 Save Attendance"):
+                    for _, r in edited_past.iterrows():
+                        execute("UPDATE scheduled_lectures SET attended=? WHERE id=? AND user_id=?",
+                               (1 if r["attended"] else 0, int(r["id"]), user_id))
+                    st.success("Attendance saved! Mastery updated.")
+                    st.rerun()
+            else:
+                st.info("No past lectures.")
+
+            st.write("**🗑️ Delete Lectures:**")
+            lec_options = lectures_df.apply(lambda r: f"{r['lecture_date']} - {r['topics_planned'][:30] if r['topics_planned'] else 'No topics'}", axis=1).tolist()
+            lec_to_delete = st.selectbox("Select lecture to delete", lec_options, key="del_lec")
+            if st.button("🗑️ Delete Selected Lecture"):
+                lec_idx = lec_options.index(lec_to_delete)
+                lec_id = int(lectures_df.iloc[lec_idx]["id"])
+                execute("DELETE FROM scheduled_lectures WHERE id=? AND user_id=?", (lec_id, user_id))
+                st.success("Lecture deleted!")
+                st.rerun()
+        else:
+            st.info("No lectures scheduled yet. Add one above!")
+
+    # ============ EXPORT DATA EXPANDER ============
+    with st.expander("📤 Export Data", expanded=False):
+        topics_export = read_sql("SELECT * FROM topics WHERE user_id=? AND course_id=?", (user_id, course_id))
+        sessions_export = read_sql("""
+            SELECT s.*, t.topic_name FROM study_sessions s
             JOIN topics t ON s.topic_id = t.id
             WHERE t.user_id = ? AND t.course_id = ?
-            ORDER BY s.session_date DESC
-            LIMIT 30
         """, (user_id, course_id))
-        
-        if not sessions_df.empty:
-            sessions_df["delete"] = False
-            edited_sessions = st.data_editor(
-                sessions_df,
-                column_config={
-                    "id": st.column_config.NumberColumn("ID", disabled=True),
-                    "delete": st.column_config.CheckboxColumn("🗑️ Delete", default=False),
-                },
-                use_container_width=True,
-                hide_index=True,
-                key="sessions_editor"
-            )
-            
-            if st.button("🗑️ Delete Selected Sessions"):
-                to_delete = edited_sessions[edited_sessions["delete"] == True]["id"].tolist()
-                if to_delete:
-                    for sid in to_delete:
-                        execute("DELETE FROM study_sessions WHERE id=?", (int(sid),))
-                    st.success(f"Deleted {len(to_delete)} session(s)!")
-                    st.rerun()
-
-# ============ EXERCISES TAB ============
-with tabs[6]:
-    st.subheader("🏋️ Exercises")
-    st.caption("Log practice questions/exercises completed for a topic.")
-    
-    topics_df = read_sql("SELECT id, topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name", 
-                         (user_id, course_id))
-    
-    if topics_df.empty:
-        st.warning("Add topics first!")
-    else:
-        with st.form("exercise_form"):
-            topic_options = topics_df["topic_name"].tolist()
-            selected_topic = st.selectbox("Topic", topic_options)
-            topic_id = int(topics_df.loc[topics_df["topic_name"] == selected_topic, "id"].iloc[0])
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                ex_date = st.date_input("Date", value=date.today())
-            with col2:
-                total_q = st.number_input("Total questions", min_value=1, value=10)
-            with col3:
-                correct = st.number_input("Correct answers", min_value=0, max_value=100, value=10)
-            
-            source = st.text_input("Source (optional)", placeholder="e.g., 2023 Past Paper")
-            notes = st.text_area("Notes (optional)")
-            
-            if st.form_submit_button("💪 Save Exercises"):
-                execute_returning("INSERT INTO exercises(topic_id, exercise_date, total_questions, correct_answers, source, notes) VALUES(?,?,?,?,?,?)",
-                                 (topic_id, str(ex_date), total_q, min(correct, total_q), source, notes))
-                st.success(f"Logged {min(correct, total_q)}/{total_q} correct!")
-                st.rerun()
-        
-        st.subheader("Recent Exercises")
-        exercises_df = read_sql("""
-            SELECT e.id, t.topic_name, e.exercise_date, e.total_questions, e.correct_answers, e.source
-            FROM exercises e
+        exercises_export = read_sql("""
+            SELECT e.*, t.topic_name FROM exercises e
             JOIN topics t ON e.topic_id = t.id
             WHERE t.user_id = ? AND t.course_id = ?
-            ORDER BY e.exercise_date DESC
-            LIMIT 30
         """, (user_id, course_id))
-        
-        if not exercises_df.empty:
-            exercises_df["score"] = (exercises_df["correct_answers"] / exercises_df["total_questions"] * 100).round(0).astype(int).astype(str) + "%"
-            exercises_df["delete"] = False
-            
-            edited_exercises = st.data_editor(
-                exercises_df,
-                column_config={
-                    "id": st.column_config.NumberColumn("ID", disabled=True),
-                    "delete": st.column_config.CheckboxColumn("🗑️ Delete", default=False),
-                },
-                use_container_width=True,
-                hide_index=True,
-                key="exercises_editor"
-            )
-            
-            if st.button("🗑️ Delete Selected Exercises"):
-                to_delete = edited_exercises[edited_exercises["delete"] == True]["id"].tolist()
-                if to_delete:
-                    for eid in to_delete:
-                        execute("DELETE FROM exercises WHERE id=?", (int(eid),))
-                    st.success(f"Deleted {len(to_delete)} exercise(s)!")
-                    st.rerun()
+        lectures_export = read_sql("SELECT * FROM scheduled_lectures WHERE user_id=? AND course_id=?", (user_id, course_id))
+        exams_export = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=?", (user_id, course_id))
+        timed_export = read_sql("SELECT * FROM timed_attempts WHERE user_id=? AND course_id=?", (user_id, course_id))
+        assessments_export = read_sql("SELECT * FROM assessments WHERE user_id=? AND course_id=?", (user_id, course_id))
 
-# ============ TIMED ATTEMPTS TAB ============
-with tabs[7]:
-    st.subheader("⏱️ Timed Practice Attempts")
-    st.caption("Log timed past-paper or practice exam attempts. Performance on specific topics boosts your readiness predictions.")
-    
-    # Get topics for multi-select
-    topics_df_ta = read_sql("SELECT topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name", 
-                            (user_id, course_id))
-    topic_names_ta = topics_df_ta["topic_name"].tolist() if not topics_df_ta.empty else []
-    
-    st.write("**Log New Attempt:**")
-    with st.form("timed_attempt_form"):
         col1, col2 = st.columns(2)
         with col1:
-            ta_date = st.date_input("Attempt date", value=date.today())
-            ta_source = st.text_input("Source", placeholder="e.g., 2023 Past Paper, Mock Exam 1")
+            st.download_button("📥 Topics", topics_export.to_csv(index=False).encode("utf-8"), "topics.csv", "text/csv", key="exp_topics")
+            st.download_button("📥 Study Sessions", sessions_export.to_csv(index=False).encode("utf-8"), "study_sessions.csv", "text/csv", key="exp_sessions")
+            st.download_button("📥 Exercises", exercises_export.to_csv(index=False).encode("utf-8"), "exercises.csv", "text/csv", key="exp_exercises")
+            st.download_button("📥 Assessments", assessments_export.to_csv(index=False).encode("utf-8"), "assessments.csv", "text/csv", key="exp_assessments")
         with col2:
-            ta_minutes = st.number_input("Duration (minutes)", min_value=1, value=60)
-            ta_score = st.slider("Score (%)", min_value=0, max_value=100, value=70, help="Your percentage score on this attempt")
-        
-        if topic_names_ta:
-            ta_topics = st.multiselect("Topics covered in this attempt", topic_names_ta, 
-                                       help="Select all topics that were tested in this paper/exam")
-        else:
-            ta_topics = []
-            st.warning("Add topics first to tag them in your attempts.")
-        
-        ta_notes = st.text_area("Notes (optional)", placeholder="e.g., Struggled with Q3, ran out of time on last section")
-        
-        if st.form_submit_button("📝 Log Attempt", type="primary"):
-            if ta_source.strip():
-                topics_str = ", ".join(ta_topics) if ta_topics else ""
-                execute_returning(
-                    "INSERT INTO timed_attempts(user_id, course_id, attempt_date, source, minutes, score_pct, topics, notes) VALUES(?,?,?,?,?,?,?,?)",
-                    (user_id, course_id, str(ta_date), ta_source.strip(), ta_minutes, ta_score / 100.0, topics_str, ta_notes)
-                )
-                st.success("Attempt logged! Your readiness predictions have been updated.")
-                st.rerun()
-            else:
-                st.error("Please enter a source for this attempt.")
-    
-    st.divider()
-    
-    # Display existing timed attempts
-    timed_df = read_sql("""
-        SELECT id, attempt_date, source, minutes, score_pct, topics, notes 
-        FROM timed_attempts 
-        WHERE user_id=? AND course_id=? 
-        ORDER BY attempt_date DESC
-    """, (user_id, course_id))
-    
-    if not timed_df.empty:
-        st.write(f"**Your Timed Attempts ({len(timed_df)} total):**")
-        
-        # Convert date column to datetime for data_editor compatibility
-        timed_df["attempt_date"] = pd.to_datetime(timed_df["attempt_date"], errors="coerce")
-        
-        # Add delete column
-        timed_df["delete"] = False
-        timed_df["score_pct"] = (timed_df["score_pct"] * 100).round(0).astype(int)
-        
-        edited_timed = st.data_editor(
-            timed_df[["id", "attempt_date", "source", "minutes", "score_pct", "topics", "notes", "delete"]],
-            column_config={
-                "id": st.column_config.NumberColumn("ID", disabled=True),
-                "attempt_date": st.column_config.DateColumn("Date"),
-                "source": st.column_config.TextColumn("Source"),
-                "minutes": st.column_config.NumberColumn("Mins", min_value=1),
-                "score_pct": st.column_config.ProgressColumn("Score %", format="%d%%", min_value=0, max_value=100),
-                "topics": st.column_config.TextColumn("Topics Covered"),
-                "notes": st.column_config.TextColumn("Notes"),
-                "delete": st.column_config.CheckboxColumn("Delete?")
-            },
-            use_container_width=True,
-            hide_index=True,
-            key="timed_attempts_editor"
-        )
-        
-        if st.button("🗑️ Delete Selected Attempts"):
-            to_delete = edited_timed[edited_timed["delete"] == True]["id"].tolist()
-            if to_delete:
-                for tid in to_delete:
-                    execute("DELETE FROM timed_attempts WHERE id=? AND user_id=?", (int(tid), user_id))
-                st.success(f"Deleted {len(to_delete)} attempt(s)!")
-                st.rerun()
-        
-        # Stats summary
-        st.divider()
-        st.write("**Performance Summary:**")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            avg_score = timed_df["score_pct"].mean()
-            st.metric("Average Score", f"{avg_score:.0f}%")
-        with col2:
-            total_mins = timed_df["minutes"].sum()
-            st.metric("Total Practice Time", f"{total_mins // 60}h {total_mins % 60}m")
-        with col3:
-            recent_count = len(timed_df[pd.to_datetime(timed_df["attempt_date"]).dt.date >= (date.today() - timedelta(days=14))])
-            st.metric("Last 14 Days", f"{recent_count} attempts")
-    else:
-        st.info("No timed attempts logged yet. Log your first practice exam above!")
-
-# ============ LECTURE CALENDAR TAB ============
-with tabs[8]:
-    st.subheader("🎓 Lecture Calendar")
-    st.caption("Schedule lectures and track attendance. Topics in lectures boost mastery when attended.")
-    
-    topics_df = read_sql("SELECT topic_name FROM topics WHERE user_id=? AND course_id=? ORDER BY topic_name", 
-                         (user_id, course_id))
-    topic_names = topics_df["topic_name"].tolist() if not topics_df.empty else []
-    
-    st.write("**Schedule New Lecture:**")
-    with st.form("lecture_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            l_date = st.date_input("Lecture date", value=date.today())
-        with col2:
-            l_time = st.text_input("Time (optional)", placeholder="e.g., 10:00 AM")
-        
-        topics_planned = st.text_input("Topics to be covered (comma separated)", 
-                                       placeholder=", ".join(topic_names[:3]) if topic_names else "e.g., Topic A, Topic B")
-        notes = st.text_area("Notes (optional)")
-        
-        if st.form_submit_button("📅 Schedule Lecture"):
-            execute_returning("INSERT INTO scheduled_lectures(user_id, course_id, lecture_date, lecture_time, topics_planned, notes) VALUES(?,?,?,?,?,?)",
-                             (user_id, course_id, str(l_date), l_time, topics_planned, notes))
-            st.success("Lecture scheduled!")
-            st.rerun()
-    
-    lectures_df = read_sql("""
-        SELECT * FROM scheduled_lectures 
-        WHERE user_id=? AND course_id=? 
-        ORDER BY lecture_date
-    """, (user_id, course_id))
-    
-    if not lectures_df.empty:
-        today = date.today()
-        
-        lectures_df["lecture_date_parsed"] = pd.to_datetime(lectures_df["lecture_date"])
-        upcoming = lectures_df[lectures_df["lecture_date_parsed"].dt.date >= today].copy()
-        past = lectures_df[lectures_df["lecture_date_parsed"].dt.date < today].copy()
-        
-        st.write("**📅 Upcoming Lectures:**")
-        if not upcoming.empty:
-            upcoming["attended"] = upcoming["attended"].fillna(0).astype(int)
-            upcoming_display = upcoming[["id", "lecture_date", "lecture_time", "topics_planned", "notes"]].copy()
-            upcoming_display["lecture_date"] = pd.to_datetime(upcoming_display["lecture_date"])
-            
-            edited_upcoming = st.data_editor(
-                upcoming_display,
-                column_config={
-                    "id": st.column_config.NumberColumn("ID", disabled=True),
-                    "lecture_date": st.column_config.DateColumn("Date", format="ddd DD/MM"),
-                    "lecture_time": st.column_config.TextColumn("Time"),
-                    "topics_planned": st.column_config.TextColumn("Topics"),
-                },
-                use_container_width=True,
-                hide_index=True,
-                key="upcoming_lectures"
-            )
-            
-            if st.button("💾 Save Upcoming Lecture Changes"):
-                for _, r in edited_upcoming.iterrows():
-                    execute("UPDATE scheduled_lectures SET lecture_date=?, lecture_time=?, topics_planned=?, notes=? WHERE id=? AND user_id=?",
-                           (pd.to_datetime(r["lecture_date"]).strftime("%Y-%m-%d"), r["lecture_time"], r["topics_planned"], r.get("notes"), int(r["id"]), user_id))
-                st.success("Updated!")
-                st.rerun()
-        else:
-            st.info("No upcoming lectures scheduled.")
-        
-        st.write("**📋 Past Lectures (mark attendance):**")
-        if not past.empty:
-            past["attended"] = past["attended"].apply(lambda x: True if x == 1 else False)
-            past_display = past[["id", "lecture_date", "lecture_time", "topics_planned", "attended"]].copy()
-            past_display["lecture_date"] = pd.to_datetime(past_display["lecture_date"])
-            
-            edited_past = st.data_editor(
-                past_display,
-                column_config={
-                    "id": st.column_config.NumberColumn("ID", disabled=True),
-                    "lecture_date": st.column_config.DateColumn("Date", format="ddd DD/MM", disabled=True),
-                    "lecture_time": st.column_config.TextColumn("Time", disabled=True),
-                    "topics_planned": st.column_config.TextColumn("Topics", disabled=True),
-                    "attended": st.column_config.CheckboxColumn("✅ Attended"),
-                },
-                use_container_width=True,
-                hide_index=True,
-                key="past_lectures"
-            )
-            
-            if st.button("💾 Save Attendance"):
-                for _, r in edited_past.iterrows():
-                    execute("UPDATE scheduled_lectures SET attended=? WHERE id=? AND user_id=?",
-                           (1 if r["attended"] else 0, int(r["id"]), user_id))
-                st.success("Attendance saved! Mastery updated.")
-                st.rerun()
-        else:
-            st.info("No past lectures.")
-        
-        st.write("**🗑️ Delete Lectures:**")
-        lec_options = lectures_df.apply(lambda r: f"{r['lecture_date']} - {r['topics_planned'][:30] if r['topics_planned'] else 'No topics'}", axis=1).tolist()
-        lec_to_delete = st.selectbox("Select lecture to delete", lec_options, key="del_lec")
-        if st.button("🗑️ Delete Selected Lecture"):
-            lec_idx = lec_options.index(lec_to_delete)
-            lec_id = int(lectures_df.iloc[lec_idx]["id"])
-            execute("DELETE FROM scheduled_lectures WHERE id=? AND user_id=?", (lec_id, user_id))
-            st.success("Lecture deleted!")
-            st.rerun()
-    else:
-        st.info("No lectures scheduled yet. Add one above!")
-
-# ============ EXPORT TAB ============
-with tabs[9]:
-    st.subheader("📤 Export Data")
-    
-    topics_export = read_sql("SELECT * FROM topics WHERE user_id=? AND course_id=?", (user_id, course_id))
-    sessions_export = read_sql("""
-        SELECT s.*, t.topic_name FROM study_sessions s
-        JOIN topics t ON s.topic_id = t.id
-        WHERE t.user_id = ? AND t.course_id = ?
-    """, (user_id, course_id))
-    exercises_export = read_sql("""
-        SELECT e.*, t.topic_name FROM exercises e
-        JOIN topics t ON e.topic_id = t.id
-        WHERE t.user_id = ? AND t.course_id = ?
-    """, (user_id, course_id))
-    lectures_export = read_sql("SELECT * FROM scheduled_lectures WHERE user_id=? AND course_id=?", (user_id, course_id))
-    exams_export = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=?", (user_id, course_id))
-    timed_export = read_sql("SELECT * FROM timed_attempts WHERE user_id=? AND course_id=?", (user_id, course_id))
-    assessments_export = read_sql("SELECT * FROM assessments WHERE user_id=? AND course_id=?", (user_id, course_id))
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button("📥 Topics", topics_export.to_csv(index=False).encode("utf-8"), "topics.csv", "text/csv")
-        st.download_button("📥 Study Sessions", sessions_export.to_csv(index=False).encode("utf-8"), "study_sessions.csv", "text/csv")
-        st.download_button("📥 Exercises", exercises_export.to_csv(index=False).encode("utf-8"), "exercises.csv", "text/csv")
-        st.download_button("📥 Assessments", assessments_export.to_csv(index=False).encode("utf-8"), "assessments.csv", "text/csv")
-    with col2:
-        st.download_button("📥 Lectures", lectures_export.to_csv(index=False).encode("utf-8"), "lectures.csv", "text/csv")
-        st.download_button("📥 Exams", exams_export.to_csv(index=False).encode("utf-8"), "exams.csv", "text/csv")
-        st.download_button("📥 Timed Attempts", timed_export.to_csv(index=False).encode("utf-8"), "timed_attempts.csv", "text/csv")
+            st.download_button("📥 Lectures", lectures_export.to_csv(index=False).encode("utf-8"), "lectures.csv", "text/csv", key="exp_lectures")
+            st.download_button("📥 Exams", exams_export.to_csv(index=False).encode("utf-8"), "exams.csv", "text/csv", key="exp_exams")
+            st.download_button("📥 Timed Attempts", timed_export.to_csv(index=False).encode("utf-8"), "timed_attempts.csv", "text/csv", key="exp_timed")
