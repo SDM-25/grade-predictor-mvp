@@ -163,6 +163,10 @@ if "hours_per_week" not in st.session_state:
 if "session_length" not in st.session_state:
     st.session_state.session_length = 60
 
+# Empty state navigation flag
+if "navigate_to_exams" not in st.session_state:
+    st.session_state.navigate_to_exams = False
+
 # ============ AUTO-LOGIN WITH PERSISTENT TOKEN ============
 # Initialize cookie manager
 if HAS_COOKIE_MANAGER:
@@ -844,381 +848,401 @@ tabs = st.tabs(["📊 Dashboard", "📋 Assessments", "📅 Exams", "📖 Topics
 with tabs[0]:
     today = date.today()
 
-    # ============ VIEW TOGGLE (GLOBAL vs COURSE) ============
-    st.subheader("📊 Dashboard")
+    # ============ EMPTY STATE CHECK ============
+    total_exams_df = read_sql("SELECT COUNT(*) as cnt FROM exams WHERE user_id=?", (user_id,))
+    has_exams = total_exams_df.iloc[0]['cnt'] > 0 if not total_exams_df.empty else False
 
-    view_col1, view_col2 = st.columns([2, 1])
-    with view_col1:
-        dashboard_view = st.radio(
-            "View:",
-            options=["🌍 Global (All Courses)", f"📚 Course ({selected_course})"],
-            horizontal=True,
-            key="dashboard_view"
-        )
+    if not has_exams:
+        # ============ EMPTY STATE UI ============
+        st.markdown("## Track your exam readiness.")
+        st.markdown("")
+        st.info("📭 **No exams yet.** Add your first exam to get started.")
+        st.markdown("")
 
-    is_global_view = "Global" in dashboard_view
+        if st.button("➕ Add exam", type="primary", use_container_width=True):
+            st.session_state.navigate_to_exams = True
+            st.toast("👆 Click the **📅 Exams** tab above to add your first exam!", icon="👆")
+            st.rerun()
 
-    st.divider()
+        if st.session_state.navigate_to_exams:
+            st.warning("👆 Click the **📅 Exams** tab above to create your first exam.")
 
-    # ============ GLOBAL VIEW ============
-    if is_global_view:
-        st.markdown("### 🌍 All Courses Overview")
+    if has_exams:
+        # ============ VIEW TOGGLE (GLOBAL vs COURSE) ============
+        st.subheader("📊 Dashboard")
 
-        # Get all courses
-        all_courses = get_all_courses(user_id)
+        view_col1, view_col2 = st.columns([2, 1])
+        with view_col1:
+            dashboard_view = st.radio(
+                "View:",
+                options=["🌍 Global (All Courses)", f"📚 Course ({selected_course})"],
+                horizontal=True,
+                key="dashboard_view"
+            )
 
-        if all_courses.empty:
-            st.info("📚 No courses yet. Select a course from the sidebar to get started.")
-        else:
-            # ============ SECTION 1: UPCOMING ASSESSMENTS ============
-            st.subheader("📅 Upcoming Assessments (Next 30 Days)")
+        is_global_view = "Global" in dashboard_view
 
-            upcoming_assessments = get_all_upcoming_assessments(user_id, days_ahead=30)
+        st.divider()
 
-            if not upcoming_assessments.empty:
-                # Format the table
-                assessment_display = []
-                for _, asmt in upcoming_assessments.iterrows():
-                    due_date = pd.to_datetime(asmt['due_date']).date()
-                    days_until = (due_date - today).days
+        # ============ GLOBAL VIEW ============
+        if is_global_view:
+            st.markdown("### 🌍 All Courses Overview")
 
-                    if days_until <= 3:
-                        urgency = "🔴"
-                    elif days_until <= 7:
-                        urgency = "🟡"
-                    else:
-                        urgency = "🟢"
+            # Get all courses
+            all_courses = get_all_courses(user_id)
 
-                    assessment_display.append({
-                        "": urgency,
-                        "Course": asmt['course_name'],
-                        "Assessment": asmt['assessment_name'],
-                        "Type": asmt['assessment_type'],
-                        "Marks": int(asmt['marks']),
-                        "Due Date": due_date.strftime("%a %d/%m/%Y"),
-                        "Days Left": days_until
-                    })
-
-                assessment_df = pd.DataFrame(assessment_display)
-                st.dataframe(assessment_df, use_container_width=True, hide_index=True)
+            if all_courses.empty:
+                st.info("📚 No courses yet. Select a course from the sidebar to get started.")
             else:
-                st.info("✅ No upcoming assessments in the next 30 days.")
+                # ============ SECTION 1: UPCOMING ASSESSMENTS ============
+                st.subheader("📅 Upcoming Assessments (Next 30 Days)")
 
-            st.divider()
+                upcoming_assessments = get_all_upcoming_assessments(user_id, days_ahead=30)
 
-            # ============ SECTION 2: RECOMMENDED ACTIONS ============
-            st.subheader("💡 Recommended Actions (Top 10)")
+                if not upcoming_assessments.empty:
+                    # Format the table
+                    assessment_display = []
+                    for _, asmt in upcoming_assessments.iterrows():
+                        due_date = pd.to_datetime(asmt['due_date']).date()
+                        days_until = (due_date - today).days
 
-            recommended_tasks = generate_recommended_tasks(user_id, course_id=None, max_tasks=10)
+                        if days_until <= 3:
+                            urgency = "🔴"
+                        elif days_until <= 7:
+                            urgency = "🟡"
+                        else:
+                            urgency = "🟢"
 
-            if recommended_tasks:
-                # Display tasks as cards
-                for i, task in enumerate(recommended_tasks[:10]):
-                    task_type_icons = {
-                        'assessment_due': '📝',
-                        'timed_attempt': '⏱️',
-                        'review_topic': '📖',
-                        'do_exercises': '🏋️',
-                        'setup_missing': '⚙️'
-                    }
+                        assessment_display.append({
+                            "": urgency,
+                            "Course": asmt['course_name'],
+                            "Assessment": asmt['assessment_name'],
+                            "Type": asmt['assessment_type'],
+                            "Marks": int(asmt['marks']),
+                            "Due Date": due_date.strftime("%a %d/%m/%Y"),
+                            "Days Left": days_until
+                        })
 
-                    icon = task_type_icons.get(task['task_type'], '📌')
-                    course_tag = f"**{task['course_name']}**"
-                    time_info = f" · ~{task['est_minutes']}min" if task.get('est_minutes') else ""
+                    assessment_df = pd.DataFrame(assessment_display)
+                    st.dataframe(assessment_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("✅ No upcoming assessments in the next 30 days.")
 
-                    st.markdown(f"{i+1}. {icon} {task['title']} ({course_tag}){time_info}")
-                    st.caption(f"   ↳ {task['detail']}")
-            else:
-                st.info("🎉 All caught up! No urgent actions needed.")
+                st.divider()
 
-            st.divider()
+                # ============ SECTION 2: RECOMMENDED ACTIONS ============
+                st.subheader("💡 Recommended Actions (Top 10)")
 
-            # ============ SECTION 3: AT-RISK COURSES ============
-            st.subheader("⚠️ At-Risk Courses")
+                recommended_tasks = generate_recommended_tasks(user_id, course_id=None, max_tasks=10)
 
-            at_risk = get_at_risk_courses(user_id, readiness_threshold=0.6, days_threshold=21)
+                if recommended_tasks:
+                    # Display tasks as cards
+                    for i, task in enumerate(recommended_tasks[:10]):
+                        task_type_icons = {
+                            'assessment_due': '📝',
+                            'timed_attempt': '⏱️',
+                            'review_topic': '📖',
+                            'do_exercises': '🏋️',
+                            'setup_missing': '⚙️'
+                        }
 
-            if at_risk:
-                risk_data = []
-                for course_snapshot in at_risk:
-                    status_icons = {
-                        'at_risk': '🔴',
-                        'borderline': '🟡',
-                        'on_track': '🟢'
-                    }
+                        icon = task_type_icons.get(task['task_type'], '📌')
+                        course_tag = f"**{task['course_name']}**"
+                        time_info = f" · ~{task['est_minutes']}min" if task.get('est_minutes') else ""
 
-                    risk_data.append({
-                        "": status_icons.get(course_snapshot['status'], '⚪'),
-                        "Course": course_snapshot['course_name'],
-                        "Readiness": f"{course_snapshot['readiness_pct']:.0f}%",
-                        "Predicted": f"{course_snapshot['predicted_marks']:.0f}/{course_snapshot['total_marks']}",
-                        "Days Left": course_snapshot['days_left'] if course_snapshot['days_left'] else "—",
-                        "Next Due": course_snapshot['next_assessment_name'] or "—"
-                    })
+                        st.markdown(f"{i+1}. {icon} {task['title']} ({course_tag}){time_info}")
+                        st.caption(f"   ↳ {task['detail']}")
+                else:
+                    st.info("🎉 All caught up! No urgent actions needed.")
 
-                risk_df = pd.DataFrame(risk_data)
-                st.dataframe(risk_df, use_container_width=True, hide_index=True)
+                st.divider()
 
-                st.caption("💡 **Tip**: Switch to Course view to see detailed recommendations for each course.")
-            else:
-                st.success("✅ All courses are on track! Keep up the great work.")
+                # ============ SECTION 3: AT-RISK COURSES ============
+                st.subheader("⚠️ At-Risk Courses")
 
-            st.divider()
+                at_risk = get_at_risk_courses(user_id, readiness_threshold=0.6, days_threshold=21)
 
-            # ============ SECTION 4: QUICK COURSE SUMMARY ============
-            st.subheader("📊 All Courses Summary")
-
-            course_summaries = []
-            for _, course in all_courses.iterrows():
-                cid = int(course['id'])
-                cname = course['course_name']
-
-                has_topics = get_course_topic_count(user_id, cid) > 0
-                has_assessments = get_course_assessment_count(user_id, cid) > 0
-
-                if has_topics:
-                    # Compute snapshot
-                    snapshot = compute_course_snapshot(user_id, cid)
-                    if snapshot:
+                if at_risk:
+                    risk_data = []
+                    for course_snapshot in at_risk:
                         status_icons = {
                             'at_risk': '🔴',
                             'borderline': '🟡',
                             'on_track': '🟢'
                         }
 
-                        course_summaries.append({
-                            "": status_icons.get(snapshot['status'], '⚪'),
-                            "Course": cname,
-                            "Predicted": f"{snapshot['predicted_marks']:.0f}/{snapshot['total_marks']}",
-                            "Target": f"{snapshot['target_marks']}",
-                            "Readiness": f"{snapshot['readiness_pct']:.0f}%",
-                            "Days Left": snapshot['days_left'] if snapshot['days_left'] else "—"
+                        risk_data.append({
+                            "": status_icons.get(course_snapshot['status'], '⚪'),
+                            "Course": course_snapshot['course_name'],
+                            "Readiness": f"{course_snapshot['readiness_pct']:.0f}%",
+                            "Predicted": f"{course_snapshot['predicted_marks']:.0f}/{course_snapshot['total_marks']}",
+                            "Days Left": course_snapshot['days_left'] if course_snapshot['days_left'] else "—",
+                            "Next Due": course_snapshot['next_assessment_name'] or "—"
                         })
+
+                    risk_df = pd.DataFrame(risk_data)
+                    st.dataframe(risk_df, use_container_width=True, hide_index=True)
+
+                    st.caption("💡 **Tip**: Switch to Course view to see detailed recommendations for each course.")
                 else:
-                    course_summaries.append({
-                        "": "⚙️",
-                        "Course": cname,
-                        "Predicted": "—",
-                        "Target": "—",
-                        "Readiness": "—",
-                        "Days Left": "Setup needed"
-                    })
+                    st.success("✅ All courses are on track! Keep up the great work.")
 
-            if course_summaries:
-                summary_df = pd.DataFrame(course_summaries)
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                st.divider()
 
-    # ============ COURSE VIEW ============
-    else:
-        st.markdown(f"### 📚 {selected_course} — Course Dashboard")
+                # ============ SECTION 4: QUICK COURSE SUMMARY ============
+                st.subheader("📊 All Courses Summary")
 
-        # Get course total marks from assessments
-        course_total_marks = get_course_total_marks(user_id, course_id)
-        if course_total_marks == 0:
-            ensure_default_assessment(user_id, course_id)
-            course_total_marks = get_course_total_marks(user_id, course_id)
+                course_summaries = []
+                for _, course in all_courses.iterrows():
+                    cid = int(course['id'])
+                    cname = course['course_name']
 
-        # Get next due date from assessments (primary source)
-        next_due, next_assessment_name, next_is_timed = get_next_due_date(user_id, course_id, today)
+                    has_topics = get_course_topic_count(user_id, cid) > 0
+                    has_assessments = get_course_assessment_count(user_id, cid) > 0
 
-        # Fallback to exams table for backward compatibility
-        exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date",
-                            (user_id, course_id))
+                    if has_topics:
+                        # Compute snapshot
+                        snapshot = compute_course_snapshot(user_id, cid)
+                        if snapshot:
+                            status_icons = {
+                                'at_risk': '🔴',
+                                'borderline': '🟡',
+                                'on_track': '🟢'
+                            }
 
-        # Determine tracking date and retake status
-        if next_due:
-            # Use assessment due date
-            tracking_date = next_due
-            days_left = max((tracking_date - today).days, 0)
-            is_retake = not next_is_timed  # Non-timed assessments treated like retakes (no lecture requirement)
-            st.caption(f"📅 Tracking: **{next_assessment_name}** (due {tracking_date.strftime('%d/%m/%Y')})")
-        elif not exams_df.empty:
-            # Fallback to exam date
-            exam_options = exams_df.apply(lambda r: f"{r['exam_name']} ({r['exam_date']}){' 🔄 RETAKE' if r.get('is_retake', 0) == 1 else ''}", axis=1).tolist()
-            selected_exam_idx = st.selectbox("Select exam to track", range(len(exam_options)), format_func=lambda i: exam_options[i])
-            exam_row = exams_df.iloc[selected_exam_idx]
-            tracking_date = pd.to_datetime(exam_row["exam_date"]).date()
-            days_left = max((tracking_date - today).days, 0)
-            is_retake = bool(exam_row.get("is_retake", 0))
-        else:
-            # No assessments — show empty state
-            st.warning("⚠️ No assessments with due dates.")
-            st.info("👉 Go to **Assessments** tab to add assessments for this course.")
-            tracking_date = None
-            days_left = 30  # Default for calculations
-            is_retake = False
-
-        if is_retake:
-            st.info("🔄 **Non-timed assessment** — Lectures not included in readiness calculations.")
-
-        topics_df = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id",
-                             (user_id, course_id))
-        upcoming_lectures = read_sql("""
-            SELECT * FROM scheduled_lectures
-            WHERE user_id=? AND course_id=? AND lecture_date >= ?
-            ORDER BY lecture_date LIMIT 10
-        """, (user_id, course_id, str(today)))
-    
-        # Get timed attempts data for dashboard display
-        timed_attempts_df = read_sql("""
-            SELECT * FROM timed_attempts 
-            WHERE user_id=? AND course_id=? 
-            ORDER BY attempt_date DESC
-        """, (user_id, course_id))
-    
-        # Timed attempts stats
-        recent_timed = timed_attempts_df[
-            pd.to_datetime(timed_attempts_df["attempt_date"]).dt.date >= (today - timedelta(days=14))
-        ] if not timed_attempts_df.empty else pd.DataFrame()
-        latest_timed_score = timed_attempts_df.iloc[0]["score_pct"] * 100 if not timed_attempts_df.empty else None
-        timed_count_14d = len(recent_timed)
-    
-        if topics_df.empty:
-            st.info("📖 No topics added yet. Go to Topics tab to add some.")
-        else:
-            # ============ USE CANONICAL SNAPSHOT FOR PREDICTIONS ============
-            # This ensures At-Risk, All Courses Summary, and Course Dashboard
-            # all show the SAME predicted values for the same course.
-            snapshot = compute_course_snapshot(user_id, course_id, is_retake=is_retake)
-            
-            # Extract values from canonical snapshot
-            pred_marks = snapshot['predicted_marks']
-            retention_pct = snapshot['readiness_pct'] / 100  # Convert back to 0-1 for display compatibility
-            coverage_pct = snapshot['coverage_pct'] / 100
-            practice_blend = snapshot['practice_blend'] / 100
-            
-            # Show actual marks breakdown if applicable
-            if snapshot['has_actual_marks']:
-                actual_marks_earned = snapshot['actual_marks_earned']
-                actual_marks_possible = snapshot['actual_marks_possible']
-                remaining_marks = total_marks - actual_marks_possible
-                
-                if remaining_marks > 0:
-                    predicted_remaining = pred_marks - actual_marks_earned
-                    actual_pct = (actual_marks_earned / actual_marks_possible * 100) if actual_marks_possible > 0 else 0
-                    st.info(f"📊 **Grade Breakdown**: Actual: {int(actual_marks_earned)}/{int(actual_marks_possible)} ({actual_pct:.0f}%) + Predicted: {predicted_remaining:.1f}/{remaining_marks}")
-                else:
-                    actual_pct = (actual_marks_earned / total_marks * 100) if total_marks > 0 else 0
-                    st.success(f"✅ **All assessments completed!** Final grade: {int(actual_marks_earned)}/{total_marks} ({actual_pct:.0f}%)")
-
-            # Show prediction mode indicator
-            if practice_blend > 0:
-                blend_pct = int(practice_blend * 100)
-                if blend_pct < 25:
-                    blend_desc = "📚 **Study Focus** — Predictions weighted toward mastery & review"
-                elif blend_pct < 50:
-                    blend_desc = "⚖️ **Balanced** — Mixing mastery with practice performance"
-                else:
-                    blend_desc = "🎯 **Practice Focus** — Predictions weighted toward timed attempts"
-                st.caption(f"{blend_desc} (Practice weight: {blend_pct}%)")
-        
-            st.divider()
-        
-            # Main metrics row
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Predicted", f"{pred_marks:.1f} / {total_marks}", delta=f"Target: {target_marks}")
-            c2.metric("Readiness", f"{retention_pct*100:.0f}%")
-            c3.metric("Days left", f"{days_left}" if tracking_date else "N/A")
-            c4.metric("Coverage", f"{coverage_pct*100:.0f}%")
-        
-            # Timed attempts metric
-            if latest_timed_score is not None:
-                c5.metric("Last Practice", f"{latest_timed_score:.0f}%", delta=f"{timed_count_14d} in 14d")
-            else:
-                c5.metric("Last Practice", "—", delta="No attempts yet")
-        
-            status_icon = {"at_risk": "🔴 AT RISK", "borderline": "🟡 BORDERLINE", "on_track": "🟢 ON TRACK"}
-            st.write(f"**Status:** {status_icon.get(snapshot['status'], '⚪ UNKNOWN')}")
-            
-            # ============ COMPUTE TOPICS_SCORED FOR RECOMMENDATIONS/STUDY PLAN ============
-            # We still need topics_scored for the recommendation engine and study plan
-            mastery_data = []
-            for _, row in topics_df.iterrows():
-                m, last_act, ex_cnt, st_cnt, lec_cnt, timed_sig, timed_cnt = compute_mastery(int(row["id"]), today, is_retake)
-                mastery_data.append({
-                    "id": row["id"],
-                    "topic_name": row["topic_name"],
-                    "weight_points": row["weight_points"],
-                    "mastery": round(m, 2),
-                    "last_activity": last_act,
-                    "exercises": ex_cnt,
-                    "study_sessions": st_cnt,
-                    "lectures": lec_cnt if not is_retake else 0,
-                    "timed_signal": timed_sig,
-                    "timed_count": timed_cnt
-                })
-        
-            topics_with_mastery = pd.DataFrame(mastery_data)
-            
-            # DIRECT CALCULATION - bypassing compute_readiness to fix 1% bug
-            # Readiness = mastery / 5.0 (mastery is 0-5 scale)
-            topics_scored = topics_with_mastery.copy()
-            topics_scored["readiness"] = topics_scored["mastery"] / 5.0
-            topics_scored["expected_points"] = topics_scored["weight_points"] * topics_scored["readiness"]
-            # Compute gap_score BEFORE creating topics_display (gap = weight * (1 - readiness))
-            topics_scored["gap_score"] = topics_scored["weight_points"] * (1.0 - topics_scored["readiness"])
-            weight_sum = float(topics_scored["weight_points"].sum()) if not topics_scored.empty else 0.0
-            expected_sum = float(topics_scored["expected_points"].sum()) if not topics_scored.empty else 0.0
-
-            # Create display version with readiness as percentage string
-            topics_display = topics_scored.copy()
-            topics_display["Readiness %"] = topics_display["readiness"].apply(lambda x: f"{int(x * 100)}%")
-        
-            # ============ PER-ASSESSMENT BREAKDOWN ============
-            st.subheader("📊 Assessment Breakdown")
-        
-            all_assessments = read_sql("""
-                SELECT id, assessment_name, assessment_type, marks, actual_marks, progress_pct, due_date, is_timed
-                FROM assessments WHERE user_id=? AND course_id=? ORDER BY due_date, id
-            """, (user_id, course_id))
-        
-            if not all_assessments.empty:
-                # Calculate predicted marks per assessment
-                avg_readiness = retention_pct if weight_sum > 0 else 0.5
-            
-                breakdown_data = []
-                for _, asmt in all_assessments.iterrows():
-                    asmt_marks = asmt["marks"]
-                    actual = asmt["actual_marks"]
-                    progress = asmt["progress_pct"] or 0
-                    is_timed = asmt["is_timed"] == 1
-        
-                    if pd.notna(actual):
-                        # Already completed
-                        predicted = actual
-                        status_icon = "✅"
-                        status_text = f"Completed: {int(actual)}/{asmt_marks}"
-                    elif is_timed:
-                        # Exam - use readiness
-                        predicted = asmt_marks * avg_readiness
-                        status_icon = "📝"
-                        pct = int(avg_readiness * 100)
-                        status_text = f"Predicted: {predicted:.0f}/{asmt_marks} ({pct}%)"
+                            course_summaries.append({
+                                "": status_icons.get(snapshot['status'], '⚪'),
+                                "Course": cname,
+                                "Predicted": f"{snapshot['predicted_marks']:.0f}/{snapshot['total_marks']}",
+                                "Target": f"{snapshot['target_marks']}",
+                                "Readiness": f"{snapshot['readiness_pct']:.0f}%",
+                                "Days Left": snapshot['days_left'] if snapshot['days_left'] else "—"
+                            })
                     else:
-                        # Assignment - use progress + readiness blend
-                        if progress >= 100:
-                            predicted = asmt_marks * avg_readiness
-                            status_icon = "📤"
-                            status_text = f"Ready to submit: ~{predicted:.0f}/{asmt_marks}"
-                        else:
-                            # Partial progress - scale prediction
-                            progress_factor = progress / 100
-                            predicted = asmt_marks * (0.5 + 0.5 * progress_factor) * avg_readiness
-                            status_icon = "🔄"
-                            status_text = f"In progress ({progress}%): ~{predicted:.0f}/{asmt_marks}"
-        
-                    breakdown_data.append({
-                        "": status_icon,
-                        "Assessment": asmt["assessment_name"],
-                        "Type": asmt["assessment_type"],
-                        "Marks": f"{int(asmt_marks)}",
-                        "Status": status_text
+                        course_summaries.append({
+                            "": "⚙️",
+                            "Course": cname,
+                            "Predicted": "—",
+                            "Target": "—",
+                            "Readiness": "—",
+                            "Days Left": "Setup needed"
+                        })
+
+                if course_summaries:
+                    summary_df = pd.DataFrame(course_summaries)
+                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+        # ============ COURSE VIEW ============
+        else:
+            st.markdown(f"### 📚 {selected_course} — Course Dashboard")
+
+            # Get course total marks from assessments
+            course_total_marks = get_course_total_marks(user_id, course_id)
+            if course_total_marks == 0:
+                ensure_default_assessment(user_id, course_id)
+                course_total_marks = get_course_total_marks(user_id, course_id)
+
+            # Get next due date from assessments (primary source)
+            next_due, next_assessment_name, next_is_timed = get_next_due_date(user_id, course_id, today)
+
+            # Fallback to exams table for backward compatibility
+            exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date",
+                                (user_id, course_id))
+
+            # Determine tracking date and retake status
+            if next_due:
+                # Use assessment due date
+                tracking_date = next_due
+                days_left = max((tracking_date - today).days, 0)
+                is_retake = not next_is_timed  # Non-timed assessments treated like retakes (no lecture requirement)
+                st.caption(f"📅 Tracking: **{next_assessment_name}** (due {tracking_date.strftime('%d/%m/%Y')})")
+            elif not exams_df.empty:
+                # Fallback to exam date
+                exam_options = exams_df.apply(lambda r: f"{r['exam_name']} ({r['exam_date']}){' 🔄 RETAKE' if r.get('is_retake', 0) == 1 else ''}", axis=1).tolist()
+                selected_exam_idx = st.selectbox("Select exam to track", range(len(exam_options)), format_func=lambda i: exam_options[i])
+                exam_row = exams_df.iloc[selected_exam_idx]
+                tracking_date = pd.to_datetime(exam_row["exam_date"]).date()
+                days_left = max((tracking_date - today).days, 0)
+                is_retake = bool(exam_row.get("is_retake", 0))
+            else:
+                # No assessments — show empty state
+                st.warning("⚠️ No assessments with due dates.")
+                st.info("👉 Go to **Assessments** tab to add assessments for this course.")
+                tracking_date = None
+                days_left = 30  # Default for calculations
+                is_retake = False
+
+            if is_retake:
+                st.info("🔄 **Non-timed assessment** — Lectures not included in readiness calculations.")
+
+            topics_df = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id",
+                                 (user_id, course_id))
+            upcoming_lectures = read_sql("""
+                SELECT * FROM scheduled_lectures
+                WHERE user_id=? AND course_id=? AND lecture_date >= ?
+                ORDER BY lecture_date LIMIT 10
+            """, (user_id, course_id, str(today)))
+
+            # Get timed attempts data for dashboard display
+            timed_attempts_df = read_sql("""
+                SELECT * FROM timed_attempts
+                WHERE user_id=? AND course_id=?
+                ORDER BY attempt_date DESC
+            """, (user_id, course_id))
+
+            # Timed attempts stats
+            recent_timed = timed_attempts_df[
+                pd.to_datetime(timed_attempts_df["attempt_date"]).dt.date >= (today - timedelta(days=14))
+            ] if not timed_attempts_df.empty else pd.DataFrame()
+            latest_timed_score = timed_attempts_df.iloc[0]["score_pct"] * 100 if not timed_attempts_df.empty else None
+            timed_count_14d = len(recent_timed)
+
+            if topics_df.empty:
+                st.info("📖 No topics added yet. Go to Topics tab to add some.")
+            else:
+                # ============ USE CANONICAL SNAPSHOT FOR PREDICTIONS ============
+                # This ensures At-Risk, All Courses Summary, and Course Dashboard
+                # all show the SAME predicted values for the same course.
+                snapshot = compute_course_snapshot(user_id, course_id, is_retake=is_retake)
+
+                # Extract values from canonical snapshot
+                pred_marks = snapshot['predicted_marks']
+                retention_pct = snapshot['readiness_pct'] / 100  # Convert back to 0-1 for display compatibility
+                coverage_pct = snapshot['coverage_pct'] / 100
+                practice_blend = snapshot['practice_blend'] / 100
+
+                # Show actual marks breakdown if applicable
+                if snapshot['has_actual_marks']:
+                    actual_marks_earned = snapshot['actual_marks_earned']
+                    actual_marks_possible = snapshot['actual_marks_possible']
+                    remaining_marks = total_marks - actual_marks_possible
+
+                    if remaining_marks > 0:
+                        predicted_remaining = pred_marks - actual_marks_earned
+                        actual_pct = (actual_marks_earned / actual_marks_possible * 100) if actual_marks_possible > 0 else 0
+                        st.info(f"📊 **Grade Breakdown**: Actual: {int(actual_marks_earned)}/{int(actual_marks_possible)} ({actual_pct:.0f}%) + Predicted: {predicted_remaining:.1f}/{remaining_marks}")
+                    else:
+                        actual_pct = (actual_marks_earned / total_marks * 100) if total_marks > 0 else 0
+                        st.success(f"✅ **All assessments completed!** Final grade: {int(actual_marks_earned)}/{total_marks} ({actual_pct:.0f}%)")
+
+                # Show prediction mode indicator
+                if practice_blend > 0:
+                    blend_pct = int(practice_blend * 100)
+                    if blend_pct < 25:
+                        blend_desc = "📚 **Study Focus** — Predictions weighted toward mastery & review"
+                    elif blend_pct < 50:
+                        blend_desc = "⚖️ **Balanced** — Mixing mastery with practice performance"
+                    else:
+                        blend_desc = "🎯 **Practice Focus** — Predictions weighted toward timed attempts"
+                    st.caption(f"{blend_desc} (Practice weight: {blend_pct}%)")
+
+                st.divider()
+
+                # Main metrics row
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Predicted", f"{pred_marks:.1f} / {total_marks}", delta=f"Target: {target_marks}")
+                c2.metric("Readiness", f"{retention_pct*100:.0f}%")
+                c3.metric("Days left", f"{days_left}" if tracking_date else "N/A")
+                c4.metric("Coverage", f"{coverage_pct*100:.0f}%")
+
+                # Timed attempts metric
+                if latest_timed_score is not None:
+                    c5.metric("Last Practice", f"{latest_timed_score:.0f}%", delta=f"{timed_count_14d} in 14d")
+                else:
+                    c5.metric("Last Practice", "—", delta="No attempts yet")
+
+                status_icon = {"at_risk": "🔴 AT RISK", "borderline": "🟡 BORDERLINE", "on_track": "🟢 ON TRACK"}
+                st.write(f"**Status:** {status_icon.get(snapshot['status'], '⚪ UNKNOWN')}")
+
+                # ============ COMPUTE TOPICS_SCORED FOR RECOMMENDATIONS/STUDY PLAN ============
+                # We still need topics_scored for the recommendation engine and study plan
+                mastery_data = []
+                for _, row in topics_df.iterrows():
+                    m, last_act, ex_cnt, st_cnt, lec_cnt, timed_sig, timed_cnt = compute_mastery(int(row["id"]), today, is_retake)
+                    mastery_data.append({
+                        "id": row["id"],
+                        "topic_name": row["topic_name"],
+                        "weight_points": row["weight_points"],
+                        "mastery": round(m, 2),
+                        "last_activity": last_act,
+                        "exercises": ex_cnt,
+                        "study_sessions": st_cnt,
+                        "lectures": lec_cnt if not is_retake else 0,
+                        "timed_signal": timed_sig,
+                        "timed_count": timed_cnt
                     })
-            
-                breakdown_df = pd.DataFrame(breakdown_data)
-                st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
-        
-            st.subheader("💡 Recommended Actions (Next 5)")
+
+                topics_with_mastery = pd.DataFrame(mastery_data)
+
+                # DIRECT CALCULATION - bypassing compute_readiness to fix 1% bug
+                # Readiness = mastery / 5.0 (mastery is 0-5 scale)
+                topics_scored = topics_with_mastery.copy()
+                topics_scored["readiness"] = topics_scored["mastery"] / 5.0
+                topics_scored["expected_points"] = topics_scored["weight_points"] * topics_scored["readiness"]
+                # Compute gap_score BEFORE creating topics_display (gap = weight * (1 - readiness))
+                topics_scored["gap_score"] = topics_scored["weight_points"] * (1.0 - topics_scored["readiness"])
+                weight_sum = float(topics_scored["weight_points"].sum()) if not topics_scored.empty else 0.0
+                expected_sum = float(topics_scored["expected_points"].sum()) if not topics_scored.empty else 0.0
+
+                # Create display version with readiness as percentage string
+                topics_display = topics_scored.copy()
+                topics_display["Readiness %"] = topics_display["readiness"].apply(lambda x: f"{int(x * 100)}%")
+
+                # ============ PER-ASSESSMENT BREAKDOWN ============
+                st.subheader("📊 Assessment Breakdown")
+
+                all_assessments = read_sql("""
+                    SELECT id, assessment_name, assessment_type, marks, actual_marks, progress_pct, due_date, is_timed
+                    FROM assessments WHERE user_id=? AND course_id=? ORDER BY due_date, id
+                """, (user_id, course_id))
+
+                if not all_assessments.empty:
+                    # Calculate predicted marks per assessment
+                    avg_readiness = retention_pct if weight_sum > 0 else 0.5
+
+                    breakdown_data = []
+                    for _, asmt in all_assessments.iterrows():
+                        asmt_marks = asmt["marks"]
+                        actual = asmt["actual_marks"]
+                        progress = asmt["progress_pct"] or 0
+                        is_timed = asmt["is_timed"] == 1
+
+                        if pd.notna(actual):
+                            # Already completed
+                            predicted = actual
+                            status_icon = "✅"
+                            status_text = f"Completed: {int(actual)}/{asmt_marks}"
+                        elif is_timed:
+                            # Exam - use readiness
+                            predicted = asmt_marks * avg_readiness
+                            status_icon = "📝"
+                            pct = int(avg_readiness * 100)
+                            status_text = f"Predicted: {predicted:.0f}/{asmt_marks} ({pct}%)"
+                        else:
+                            # Assignment - use progress + readiness blend
+                            if progress >= 100:
+                                predicted = asmt_marks * avg_readiness
+                                status_icon = "📤"
+                                status_text = f"Ready to submit: ~{predicted:.0f}/{asmt_marks}"
+                            else:
+                                # Partial progress - scale prediction
+                                progress_factor = progress / 100
+                                predicted = asmt_marks * (0.5 + 0.5 * progress_factor) * avg_readiness
+                                status_icon = "🔄"
+                                status_text = f"In progress ({progress}%): ~{predicted:.0f}/{asmt_marks}"
+
+                        breakdown_data.append({
+                            "": status_icon,
+                            "Assessment": asmt["assessment_name"],
+                            "Type": asmt["assessment_type"],
+                            "Marks": f"{int(asmt_marks)}",
+                            "Status": status_text
+                        })
+
+                    breakdown_df = pd.DataFrame(breakdown_data)
+                    st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+
+                st.subheader("💡 Recommended Actions (Next 5)")
 
             # Generate recommended tasks for this course (gap_score already computed above)
             course_tasks = generate_recommended_tasks(user_id, course_id=course_id, max_tasks=5)
@@ -1599,8 +1623,13 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("📅 Manage Exams")
     st.caption("Add multiple exams per course, each with its own marks value.")
-    
-    exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date", 
+
+    # Show highlight if navigating from empty state
+    if st.session_state.get("navigate_to_exams", False):
+        st.success("👇 **Add your first exam below to start tracking your readiness!**")
+        st.session_state.navigate_to_exams = False
+
+    exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date",
                         (user_id, course_id))
     
     with st.form("add_exam"):
