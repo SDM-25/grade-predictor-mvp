@@ -22,6 +22,152 @@ from db import read_sql, fetchone, fetchall
 DEBUG_PREDICTION = False
 
 
+# ============ PREDICTION MATURITY ============
+
+def compute_prediction_maturity(
+    days_left: int,
+    lectures_occurred: int = 0,
+    total_lectures_planned: int = 0,
+    study_sessions: int = 0,
+    exercises: int = 0,
+    timed_attempts: int = 0
+) -> Dict:
+    """
+    Compute prediction maturity/confidence based on available evidence.
+
+    Args:
+        days_left: Days until exam/assessment
+        lectures_occurred: Number of lectures that have occurred/attended
+        total_lectures_planned: Total lectures planned (0 if unknown)
+        study_sessions: Count of study sessions logged
+        exercises: Count of exercise sets completed
+        timed_attempts: Count of timed practice attempts
+
+    Returns:
+        {
+            'maturity_score': float in [0,1],
+            'maturity_tier': 'EARLY' | 'MID' | 'LATE',
+            'reason': str (short explanation for tooltip)
+        }
+    """
+    # Component 1: Time factor (0-0.4)
+    # More days left = lower maturity (predictions are less reliable far from exam)
+    if days_left is None or days_left > 60:
+        time_factor = 0.0
+    elif days_left > 30:
+        time_factor = 0.1 + (60 - days_left) / 30 * 0.1  # 0.1 to 0.2
+    elif days_left > 14:
+        time_factor = 0.2 + (30 - days_left) / 16 * 0.1  # 0.2 to 0.3
+    elif days_left > 7:
+        time_factor = 0.3 + (14 - days_left) / 7 * 0.05  # 0.3 to 0.35
+    else:
+        time_factor = 0.35 + max(0, 7 - days_left) / 7 * 0.05  # 0.35 to 0.4
+
+    # Component 2: Lecture progress factor (0-0.3)
+    # More lectures completed = higher maturity
+    if total_lectures_planned > 0:
+        lecture_progress = lectures_occurred / total_lectures_planned
+        lecture_factor = lecture_progress * 0.3
+    else:
+        # No lectures planned - give partial credit if we have other evidence
+        lecture_factor = 0.1 if (study_sessions + exercises + timed_attempts) > 0 else 0.0
+
+    # Component 3: Evidence volume factor (0-0.3)
+    # More study evidence = higher maturity
+    evidence_count = study_sessions + exercises + timed_attempts
+    if evidence_count == 0:
+        evidence_factor = 0.0
+    elif evidence_count < 3:
+        evidence_factor = 0.05
+    elif evidence_count < 10:
+        evidence_factor = 0.1 + (evidence_count - 3) / 7 * 0.1  # 0.1 to 0.2
+    elif evidence_count < 20:
+        evidence_factor = 0.2 + (evidence_count - 10) / 10 * 0.05  # 0.2 to 0.25
+    else:
+        evidence_factor = 0.25 + min((evidence_count - 20) / 30, 1.0) * 0.05  # 0.25 to 0.3
+
+    # Combine factors
+    maturity_score = min(1.0, time_factor + lecture_factor + evidence_factor)
+
+    # Determine tier and reason
+    if maturity_score < 0.35:
+        maturity_tier = "EARLY"
+        if days_left is not None and days_left > 30:
+            reason = f"{days_left} days left, limited data"
+        elif evidence_count < 3:
+            reason = "Insufficient study data"
+        else:
+            reason = "Early in study cycle"
+    elif maturity_score < 0.65:
+        maturity_tier = "MID"
+        if lecture_factor < 0.15 and total_lectures_planned > 0:
+            reason = "More lectures needed"
+        elif evidence_count < 10:
+            reason = "Building evidence"
+        else:
+            reason = "Moderate confidence"
+    else:
+        maturity_tier = "LATE"
+        if days_left is not None and days_left <= 7:
+            reason = "Exam approaching"
+        elif evidence_count >= 20:
+            reason = "Strong evidence base"
+        else:
+            reason = "High confidence"
+
+    return {
+        'maturity_score': round(maturity_score, 2),
+        'maturity_tier': maturity_tier,
+        'reason': reason
+    }
+
+
+def compute_maturity_aware_status(
+    predicted_marks: float,
+    target_marks: float,
+    total_marks: float,
+    maturity_tier: str
+) -> str:
+    """
+    Compute status label using maturity-aware thresholds.
+
+    Margins tighten as exam approaches:
+    - EARLY: 15% margin, never show 'at_risk'
+    - MID: 8% margin, 'at_risk' only for significant gaps
+    - LATE: 4% margin, strongest labels
+
+    Returns: status string
+    """
+    # Calculate margins as percentage of total marks
+    if maturity_tier == "EARLY":
+        margin = total_marks * 0.15
+        # Never show 'at_risk' in early stage
+        if predicted_marks >= target_marks:
+            return 'on_track'
+        elif predicted_marks >= target_marks - margin:
+            return 'on_track'  # Within early margin, still OK
+        else:
+            return 'early_signal'  # Below target but too early to call at_risk
+
+    elif maturity_tier == "MID":
+        margin = total_marks * 0.08
+        if predicted_marks >= target_marks:
+            return 'on_track'
+        elif predicted_marks >= target_marks - margin:
+            return 'borderline'
+        else:
+            return 'at_risk'
+
+    else:  # LATE
+        margin = total_marks * 0.04
+        if predicted_marks >= target_marks:
+            return 'on_track'
+        elif predicted_marks >= target_marks - margin:
+            return 'borderline'
+        else:
+            return 'at_risk'
+
+
 # ============ CROSS-COURSE QUERIES ============
 
 def get_all_courses(user_id: int) -> pd.DataFrame:
@@ -293,13 +439,51 @@ def compute_course_snapshot(
             # All assessments completed
             predicted_marks = actual_marks_earned
 
-    # ============ STEP 5: Determine status ============
-    if predicted_marks < target_marks - 10:
-        status = 'at_risk'
-    elif predicted_marks < target_marks:
-        status = 'borderline'
-    else:
-        status = 'on_track'
+    # ============ STEP 5: Compute prediction maturity and status ============
+    # Gather evidence counts for maturity calculation
+    total_study_sessions = 0
+    total_exercises = 0
+    total_timed_attempts = 0
+
+    if topics_with_mastery is not None and not topics_with_mastery.empty:
+        if 'study_sessions' in topics_with_mastery.columns:
+            total_study_sessions = int(topics_with_mastery['study_sessions'].sum())
+        if 'exercises' in topics_with_mastery.columns:
+            total_exercises = int(topics_with_mastery['exercises'].sum())
+        if 'timed_count' in topics_with_mastery.columns:
+            total_timed_attempts = int(topics_with_mastery['timed_count'].sum())
+
+    # Get lecture counts (reuse lecture_data if already queried, else query now)
+    lectures_occurred = 0
+    total_lectures_planned = 0
+    if not is_retake:
+        lecture_counts = read_sql("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN lecture_date <= ? THEN 1 ELSE 0 END) as occurred
+            FROM scheduled_lectures WHERE user_id=? AND course_id=?
+        """, (str(date.today()), user_id, course_id))
+        if not lecture_counts.empty:
+            total_lectures_planned = int(lecture_counts.iloc[0]["total"] or 0)
+            lectures_occurred = int(lecture_counts.iloc[0]["occurred"] or 0)
+
+    # Compute prediction maturity
+    maturity = compute_prediction_maturity(
+        days_left=days_left,
+        lectures_occurred=lectures_occurred,
+        total_lectures_planned=total_lectures_planned,
+        study_sessions=total_study_sessions,
+        exercises=total_exercises,
+        timed_attempts=total_timed_attempts
+    )
+
+    # Compute maturity-aware status
+    status = compute_maturity_aware_status(
+        predicted_marks=predicted_marks,
+        target_marks=target_marks,
+        total_marks=total_marks,
+        maturity_tier=maturity['maturity_tier']
+    )
 
     # Debug output if enabled
     if DEBUG_PREDICTION:
@@ -329,7 +513,11 @@ def compute_course_snapshot(
         'practice_blend': practice_blend * 100,
         'has_actual_marks': has_actual_marks,
         'actual_marks_earned': actual_marks_earned,
-        'actual_marks_possible': actual_marks_possible
+        'actual_marks_possible': actual_marks_possible,
+        # Maturity info for confidence indicator
+        'maturity_score': maturity['maturity_score'],
+        'maturity_tier': maturity['maturity_tier'],
+        'maturity_reason': maturity['reason']
     }
 
 

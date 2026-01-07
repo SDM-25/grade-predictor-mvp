@@ -811,13 +811,33 @@ def compute_course_readiness(
     # Predicted marks
     predicted_marks = total_marks * retention_pct
 
-    # Status
-    if predicted_marks < target_marks - 10:
-        status = "at_risk"
-    elif predicted_marks < target_marks:
-        status = "borderline"
+    # Status with maturity-aware thresholds
+    # Use days_left to determine maturity tier (simplified version)
+    if days_left is None or days_left > 30:
+        # EARLY: use wider margin, never show at_risk
+        margin = total_marks * 0.15
+        if predicted_marks >= target_marks - margin:
+            status = "on_track"
+        else:
+            status = "early_signal"
+    elif days_left > 14:
+        # MID: use medium margin
+        margin = total_marks * 0.08
+        if predicted_marks >= target_marks:
+            status = "on_track"
+        elif predicted_marks >= target_marks - margin:
+            status = "borderline"
+        else:
+            status = "at_risk"
     else:
-        status = "on_track"
+        # LATE: use tight margin
+        margin = total_marks * 0.04
+        if predicted_marks >= target_marks:
+            status = "on_track"
+        elif predicted_marks >= target_marks - margin:
+            status = "borderline"
+        else:
+            status = "at_risk"
 
     # Topic details
     topics_out = []

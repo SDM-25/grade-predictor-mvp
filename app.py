@@ -1039,7 +1039,8 @@ with tabs[0]:
                         status_icons = {
                             'at_risk': '🔴',
                             'borderline': '🟡',
-                            'on_track': '🟢'
+                            'on_track': '🟢',
+                            'early_signal': '🟠'
                         }
 
                         risk_data.append({
@@ -1078,7 +1079,8 @@ with tabs[0]:
                             status_icons = {
                                 'at_risk': '🔴',
                                 'borderline': '🟡',
-                                'on_track': '🟢'
+                                'on_track': '🟢',
+                                'early_signal': '🟠'
                             }
 
                             course_summaries.append({
@@ -1242,8 +1244,19 @@ with tabs[0]:
                 else:
                     c5.metric("Last Practice", "—", delta="No attempts yet")
 
-                status_icon = {"at_risk": "🔴 AT RISK", "borderline": "🟡 BORDERLINE", "on_track": "🟢 ON TRACK"}
+                status_icon = {
+                    "at_risk": "🔴 AT RISK",
+                    "borderline": "🟡 BORDERLINE",
+                    "on_track": "🟢 ON TRACK",
+                    "early_signal": "🟠 EARLY SIGNAL"
+                }
                 st.write(f"**Status:** {status_icon.get(snapshot['status'], '⚪ UNKNOWN')}")
+
+                # Show confidence indicator (small text)
+                maturity_tier = snapshot.get('maturity_tier', 'MID')
+                maturity_reason = snapshot.get('maturity_reason', '')
+                confidence_label = {"EARLY": "Early", "MID": "Mid", "LATE": "Late"}.get(maturity_tier, "Mid")
+                st.caption(f"Signal confidence: {confidence_label} — {maturity_reason}")
 
                 # ============ COMPUTE TOPICS_SCORED FOR RECOMMENDATIONS/STUDY PLAN ============
                 # We still need topics_scored for the recommendation engine and study plan
