@@ -46,6 +46,13 @@ from dashboard_helpers import (
     get_at_risk_courses, get_next_prerequisite_step
 )
 
+# Import UI components
+from ui import (
+    inject_css, render_kpi_row, status_badge, render_empty_state,
+    render_setup_checklist, render_action_list, section_header,
+    card_start, card_end
+)
+
 # Import metric computation functions (NO Streamlit UI dependencies)
 from metrics import compute_mastery, decay_factor, compute_readiness
 
@@ -123,6 +130,9 @@ DEV_MODE = False
 
 st.set_page_config(page_title="Exam Readiness Predictor", page_icon="📈", layout="wide")
 init_db()
+
+# Inject global CSS styling
+inject_css()
 
 # Show database mode indicator (internal use)
 db_mode = "🐘 Postgres (Supabase)" if is_postgres() else "📁 SQLite (Local)"
@@ -883,18 +893,18 @@ with tabs[0]:
 
     if not has_exams:
         # ============ EMPTY STATE UI ============
-        st.markdown("## Track your exam readiness.")
         st.markdown("")
-        st.info("**No exams yet.** Add your first exam to get started.")
-        st.markdown("")
-
-        if st.button("Add exam", type="primary", use_container_width=True):
-            st.session_state.navigate_to_exams = True
+        if render_empty_state(
+            title="No exams yet",
+            description="Add your first exam to start tracking your readiness and get personalized study recommendations.",
+            button_label="Add exam",
+            on_click_key="navigate_to_exams"
+        ):
             st.toast("Click the Exams tab above to add your first exam!")
             st.rerun()
 
         if st.session_state.navigate_to_exams:
-            st.warning("Click the **Exams** tab above to create your first exam.")
+            st.info("Head to the **Exams** tab above to create your first exam.")
 
     if has_exams:
         # ============ VIEW TOGGLE (GLOBAL vs COURSE) ============
@@ -913,38 +923,24 @@ with tabs[0]:
         setup_incomplete = not (has_course_exams and has_course_assessments and has_course_topics)
 
         if setup_incomplete:
-            with st.container():
-                st.markdown("**Setup Checklist** — Complete these steps to get accurate predictions:")
-
-                col1, col2, col3 = st.columns(3)
-
-                with col1:
-                    if has_course_exams:
-                        st.markdown("~~Add exam~~ Done")
-                    else:
-                        if st.button("Add exam", key="checklist_exam", use_container_width=True):
-                            st.session_state.navigate_to_exams_tab = True
-                            st.rerun()
-
-                with col2:
-                    if has_course_assessments:
-                        st.markdown("~~Add assessment~~ Done")
-                    else:
-                        if st.button("Add assessment", key="checklist_assessment", use_container_width=True):
-                            st.session_state.expand_assessments = True
-                            st.session_state.navigate_to_exams_tab = True
-                            st.rerun()
-
-                with col3:
-                    if has_course_topics:
-                        st.markdown("~~Add topics~~ Done")
-                    else:
-                        if st.button("Add topics", key="checklist_topics", use_container_width=True):
-                            st.session_state.expand_topics = True
-                            st.session_state.navigate_to_exams_tab = True
-                            st.rerun()
-
-                st.divider()
+            setup_items = [
+                {'label': 'Add exam', 'done': has_course_exams, 'button_key': 'checklist_exam'},
+                {'label': 'Add assessment', 'done': has_course_assessments, 'button_key': 'checklist_assessment'},
+                {'label': 'Add topics', 'done': has_course_topics, 'button_key': 'checklist_topics'},
+            ]
+            clicked = render_setup_checklist(setup_items)
+            if clicked == 'checklist_exam':
+                st.session_state.navigate_to_exams_tab = True
+                st.rerun()
+            elif clicked == 'checklist_assessment':
+                st.session_state.expand_assessments = True
+                st.session_state.navigate_to_exams_tab = True
+                st.rerun()
+            elif clicked == 'checklist_topics':
+                st.session_state.expand_topics = True
+                st.session_state.navigate_to_exams_tab = True
+                st.rerun()
+            st.markdown("")
 
         # NOTE: Setup bar removed from Dashboard - setup actions only in Exams tab
 
@@ -1121,9 +1117,13 @@ with tabs[0]:
 
             # Gate 1: No assessments → show Setup required card
             if not has_course_assessments:
-                st.warning("**Setup required** — Add assessments to see predictions.")
-                st.caption("Assessments define what you're being graded on (exams, assignments, projects).")
-                if st.button("Add assessment", key="gate_add_assessment", type="primary", use_container_width=True):
+                st.markdown("")
+                if render_empty_state(
+                    title="Setup required",
+                    description="Add assessments to see predictions. Assessments define what you're being graded on (exams, assignments, projects).",
+                    button_label="Add assessment",
+                    on_click_key="gate_add_assessment"
+                ):
                     st.session_state.expand_assessments = True
                     st.session_state.navigate_to_exams_tab = True
                     st.rerun()
@@ -1131,9 +1131,13 @@ with tabs[0]:
 
             # Gate 2: Has assessments but no topics → show Setup required card
             elif not has_course_topics:
-                st.warning("**Setup required** — Add topics to see predictions.")
-                st.caption("Topics are the subjects you need to study for your assessments.")
-                if st.button("Add topics", key="gate_add_topics", type="primary", use_container_width=True):
+                st.markdown("")
+                if render_empty_state(
+                    title="Setup required",
+                    description="Add topics to see predictions. Topics are the subjects you need to study for your assessments.",
+                    button_label="Add topics",
+                    on_click_key="gate_add_topics"
+                ):
                     st.session_state.expand_topics = True
                     st.session_state.navigate_to_exams_tab = True
                     st.rerun()
@@ -1235,34 +1239,44 @@ with tabs[0]:
                         blend_desc = "**Practice Focus** — Predictions weighted toward timed attempts"
                     st.caption(f"{blend_desc} (Practice weight: {blend_pct}%)")
 
-                st.divider()
+                st.markdown("")
 
-                # Main metrics row
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Predicted", f"{pred_marks:.1f} / {total_marks}", delta=f"Target: {target_marks}")
-                c2.metric("Readiness", f"{retention_pct*100:.0f}%")
-                c3.metric("Days left", f"{days_left}" if tracking_date else "N/A")
-                c4.metric("Coverage", f"{coverage_pct*100:.0f}%")
-
-                # Timed attempts metric
-                if latest_timed_score is not None:
-                    c5.metric("Last Practice", f"{latest_timed_score:.0f}%", delta=f"{timed_count_14d} in 14d")
-                else:
-                    c5.metric("Last Practice", "—", delta="No attempts yet")
-
-                status_icon = {
-                    "at_risk": "🔴 AT RISK",
-                    "borderline": "🟡 BORDERLINE",
-                    "on_track": "🟢 ON TRACK",
-                    "early_signal": "🟠 EARLY SIGNAL"
-                }
-                st.write(f"**Status:** {status_icon.get(snapshot['status'], '⚪ UNKNOWN')}")
-
-                # Show confidence indicator (small text)
+                # ============ KPI CARDS ROW ============
                 maturity_tier = snapshot.get('maturity_tier', 'MID')
                 maturity_reason = snapshot.get('maturity_reason', '')
                 confidence_label = {"EARLY": "Early", "MID": "Mid", "LATE": "Late"}.get(maturity_tier, "Mid")
-                st.caption(f"Signal confidence: {confidence_label} — {maturity_reason}")
+
+                kpi_metrics = [
+                    {
+                        'label': 'Predicted',
+                        'value': f"{pred_marks:.0f}/{total_marks}",
+                        'subtext': f"Target: {target_marks}"
+                    },
+                    {
+                        'label': 'Readiness',
+                        'value': f"{retention_pct*100:.0f}%",
+                        'subtext': f"Confidence: {confidence_label}"
+                    },
+                    {
+                        'label': 'Days Left',
+                        'value': f"{days_left}" if tracking_date else "N/A",
+                        'subtext': next_assessment_name[:20] + "..." if next_assessment_name and len(next_assessment_name) > 20 else (next_assessment_name or "No due date")
+                    },
+                    {
+                        'label': 'Status',
+                        'value': '',  # Will be replaced with badge
+                        'subtext': ''
+                    },
+                ]
+                render_kpi_row(kpi_metrics[:3])
+
+                # Status badge (rendered separately for HTML badge styling)
+                st.markdown(f"""
+                <div style="text-align: center; margin-top: 0.75rem; margin-bottom: 1rem;">
+                    {status_badge(snapshot['status'])}
+                    <div class="confidence-indicator">{maturity_reason}</div>
+                </div>
+                """, unsafe_allow_html=True)
 
                 # ============ COMPUTE TOPICS_SCORED FOR RECOMMENDATIONS/STUDY PLAN ============
                 # We still need topics_scored for the recommendation engine and study plan
@@ -1299,7 +1313,8 @@ with tabs[0]:
                 topics_display["Readiness %"] = topics_display["readiness"].apply(lambda x: f"{int(x * 100)}%")
 
                 # ============ PER-ASSESSMENT BREAKDOWN ============
-                st.header("Assessment Breakdown")
+                section_header("Assessment Breakdown")
+                card_start()
 
                 all_assessments = read_sql("""
                     SELECT id, assessment_name, assessment_type, marks, actual_marks, progress_pct, due_date, is_timed
@@ -1352,35 +1367,54 @@ with tabs[0]:
                     breakdown_df = pd.DataFrame(breakdown_data)
                     st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
 
+                card_end()
+
                 # ============ GATED: RECOMMENDED ACTIONS ============
                 # Only show recommendations when prerequisites are complete
                 if prereq_step is None:
-                    st.header("Recommended Actions (Next 5)")
+                    section_header("Next Actions")
+                    card_start()
 
                     # Generate recommended tasks for this course (gap_score already computed above)
                     course_tasks = generate_recommended_tasks(user_id, course_id=course_id, max_tasks=5)
 
                     if course_tasks:
-                        task_type_labels = {
-                            'assessment_due': '[Due]',
-                            'timed_attempt': '[Practice]',
-                            'review_topic': '[Review]',
-                            'do_exercises': '[Exercises]',
-                            'setup_missing': '[Setup]'
-                        }
-
-                        for i, task in enumerate(course_tasks):
-                            label = task_type_labels.get(task['task_type'], '')
-                            time_info = f" · ~{task['est_minutes']}min" if task.get('est_minutes') else ""
-                            st.markdown(f"{i+1}. {label} **{task['title']}**{time_info}")
-                            st.caption(f"   ↳ {task['detail']}")
+                        render_action_list(course_tasks, max_items=5)
                     else:
                         # Fallback to old recommendations if task generator returns nothing
                         recs = generate_recommendations(topics_scored, upcoming_lectures, days_left, today, is_retake)
-                        for rec in recs:
-                            st.markdown(f"- {rec}")
+                        if recs:
+                            for rec in recs:
+                                st.markdown(f"- {rec}")
+                        else:
+                            st.markdown("All caught up! No urgent actions needed.")
+
+                    card_end()
+                # ============ TOP GAPS CARD ============
+                section_header("Top Gaps")
+                card_start()
+                # Defensive: ensure gap_score exists (should already be computed, but fallback if not)
+                if "gap_score" not in topics_display.columns:
+                    topics_display["gap_score"] = topics_display.get("weight_points", 0) * (1.0 - topics_display.get("readiness", 0))
+                gaps = topics_display.sort_values("gap_score", ascending=False).head(6)
+                st.dataframe(
+                    gaps[["topic_name", "weight_points", "mastery", "exercises", "study_sessions", "Readiness %"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "topic_name": st.column_config.TextColumn("Topic"),
+                        "weight_points": st.column_config.NumberColumn("Weight"),
+                        "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
+                        "exercises": st.column_config.NumberColumn("Exercises"),
+                        "study_sessions": st.column_config.NumberColumn("Sessions"),
+                        "Readiness %": st.column_config.TextColumn("Readiness"),
+                    }
+                )
+                card_end()
+
                 # ============ STUDY PLAN GENERATOR ============
-                st.header("7-Day Study Plan")
+                section_header("7-Day Study Plan")
+                card_start()
 
                 # Get settings from session state
                 hours_per_week = st.session_state.get("hours_per_week", 10)
@@ -1511,24 +1545,13 @@ with tabs[0]:
                             key="download_study_plan"
                         )
                 else:
-                    st.info("Add topics with weights to generate a study plan.")
+                    st.markdown("Add topics with weights to generate a study plan.")
 
-                st.header("Top Gaps")
-                # Defensive: ensure gap_score exists (should already be computed, but fallback if not)
-                if "gap_score" not in topics_display.columns:
-                    topics_display["gap_score"] = topics_display.get("weight_points", 0) * (1.0 - topics_display.get("readiness", 0))
-                gaps = topics_display.sort_values("gap_score", ascending=False).head(6)
-                st.dataframe(
-                    gaps[["topic_name", "weight_points", "mastery", "exercises", "study_sessions", "Readiness %", "gap_score"]],
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
-                    }
-                )
+                card_end()
 
                 if not is_retake and not upcoming_lectures.empty:
-                    st.header("Upcoming Lectures")
+                    section_header("Upcoming Lectures")
+                    card_start()
                     upcoming_lectures["lecture_date"] = pd.to_datetime(upcoming_lectures["lecture_date"])
                     st.dataframe(
                         upcoming_lectures[["lecture_date", "lecture_time", "topics_planned"]].head(5),
@@ -1536,10 +1559,14 @@ with tabs[0]:
                         hide_index=True,
                         column_config={
                             "lecture_date": st.column_config.DateColumn("Date", format="ddd DD/MM"),
+                            "lecture_time": st.column_config.TextColumn("Time"),
+                            "topics_planned": st.column_config.TextColumn("Topics"),
                         }
                     )
+                    card_end()
 
-                st.header("All Topics")
+                section_header("All Topics")
+                card_start()
                 if is_retake:
                     topics_display_cols = ["topic_name", "weight_points", "mastery", "last_activity", "exercises", "study_sessions", "Readiness %"]
                 else:
@@ -1549,9 +1576,17 @@ with tabs[0]:
                     use_container_width=True,
                     hide_index=True,
                     column_config={
+                        "topic_name": st.column_config.TextColumn("Topic"),
+                        "weight_points": st.column_config.NumberColumn("Weight"),
                         "mastery": st.column_config.ProgressColumn("Mastery", format="%.1f/5", min_value=0, max_value=5),
+                        "last_activity": st.column_config.TextColumn("Last Activity"),
+                        "exercises": st.column_config.NumberColumn("Exercises"),
+                        "study_sessions": st.column_config.NumberColumn("Sessions"),
+                        "lectures": st.column_config.NumberColumn("Lectures"),
+                        "Readiness %": st.column_config.TextColumn("Readiness"),
                     }
                 )
+                card_end()
 
 # ============ EXAMS TAB (Setup) ============
 # Contains: Exams (main), Assessments, Topics, Import Topics
