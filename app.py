@@ -1109,94 +1109,90 @@ with tabs[0]:
         else:
             st.markdown(f"### {selected_course} — Course Dashboard")
 
-            # ============ NEXT STEPS PANEL ============
-            # Check for prerequisite steps and show guided actions
+            # ============ PREREQUISITE GATES ============
+            # Check setup completion for predictions
             prereq_step = get_next_prerequisite_step(user_id, course_id)
 
-            if prereq_step:
-                # Show compact "Next Steps" card for missing prerequisites
-                with st.container():
-                    st.info(f"**Next step:** {prereq_step['message']}")
-                    col1, col2 = st.columns([1, 3])
-                    with col1:
-                        if st.button(prereq_step['button_label'], type="primary", use_container_width=True):
-                            # Store navigation hint in session state
-                            st.session_state[f"navigate_to_{prereq_step['step_type']}"] = True
-                            st.rerun()
+            # Gate 1: No assessments → show Setup required card
+            if not has_course_assessments:
+                st.warning("**Setup required** — Add assessments to see predictions.")
+                st.caption("Assessments define what you're being graded on (exams, assignments, projects).")
+                if st.button("Add assessment", key="gate_add_assessment", type="primary", use_container_width=True):
+                    st.session_state.expand_assessments = True
+                    st.session_state.navigate_to_exams_tab = True
+                    st.rerun()
+                # Stop here - don't show predictions without assessments
 
-                    # Show navigation hint if button was clicked
-                    if st.session_state.get(f"navigate_to_{prereq_step['step_type']}", False):
-                        tab_names = {
-                            'assessments': 'Assessments',
-                            'topics': 'Topics'
-                        }
-                        st.warning(f"Click the **{tab_names.get(prereq_step['step_type'], 'relevant')}** expander in the Exams tab.")
-                st.divider()
+            # Gate 2: Has assessments but no topics → show Setup required card
+            elif not has_course_topics:
+                st.warning("**Setup required** — Add topics to see predictions.")
+                st.caption("Topics are the subjects you need to study for your assessments.")
+                if st.button("Add topics", key="gate_add_topics", type="primary", use_container_width=True):
+                    st.session_state.expand_topics = True
+                    st.session_state.navigate_to_exams_tab = True
+                    st.rerun()
+                # Stop here - don't show predictions without topics
 
-            # Get course total marks from assessments
-            course_total_marks = get_course_total_marks(user_id, course_id)
-            if course_total_marks == 0:
-                ensure_default_assessment(user_id, course_id)
+            # Gate 3: All prerequisites met → show full dashboard
+            else:
+                # Get course total marks from assessments
                 course_total_marks = get_course_total_marks(user_id, course_id)
+                if course_total_marks == 0:
+                    ensure_default_assessment(user_id, course_id)
+                    course_total_marks = get_course_total_marks(user_id, course_id)
 
-            # Get next due date from assessments (primary source)
-            next_due, next_assessment_name, next_is_timed = get_next_due_date(user_id, course_id, today)
+                # Get next due date from assessments (primary source)
+                next_due, next_assessment_name, next_is_timed = get_next_due_date(user_id, course_id, today)
 
-            # Fallback to exams table for backward compatibility
-            exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date",
-                                (user_id, course_id))
+                # Fallback to exams table for backward compatibility
+                exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date",
+                                    (user_id, course_id))
 
-            # Determine tracking date and retake status
-            if next_due:
-                # Use assessment due date
-                tracking_date = next_due
-                days_left = max((tracking_date - today).days, 0)
-                is_retake = not next_is_timed  # Non-timed assessments treated like retakes (no lecture requirement)
-                st.caption(f"Tracking: **{next_assessment_name}** (due {tracking_date.strftime('%d/%m/%Y')})")
-            elif not exams_df.empty:
-                # Fallback to exam date
-                exam_options = exams_df.apply(lambda r: f"{r['exam_name']} ({r['exam_date']}){' [RETAKE]' if r.get('is_retake', 0) == 1 else ''}", axis=1).tolist()
-                selected_exam_idx = st.selectbox("Select exam to track", range(len(exam_options)), format_func=lambda i: exam_options[i])
-                exam_row = exams_df.iloc[selected_exam_idx]
-                tracking_date = pd.to_datetime(exam_row["exam_date"]).date()
-                days_left = max((tracking_date - today).days, 0)
-                is_retake = bool(exam_row.get("is_retake", 0))
-            else:
-                # No assessments — show empty state
-                st.warning("No assessments with due dates.")
-                st.info("Go to **Assessments** expander to add assessments for this course.")
-                tracking_date = None
-                days_left = 30  # Default for calculations
-                is_retake = False
+                # Determine tracking date and retake status
+                if next_due:
+                    # Use assessment due date
+                    tracking_date = next_due
+                    days_left = max((tracking_date - today).days, 0)
+                    is_retake = not next_is_timed  # Non-timed assessments treated like retakes (no lecture requirement)
+                    st.caption(f"Tracking: **{next_assessment_name}** (due {tracking_date.strftime('%d/%m/%Y')})")
+                elif not exams_df.empty:
+                    # Fallback to exam date
+                    exam_options = exams_df.apply(lambda r: f"{r['exam_name']} ({r['exam_date']}){' [RETAKE]' if r.get('is_retake', 0) == 1 else ''}", axis=1).tolist()
+                    selected_exam_idx = st.selectbox("Select exam to track", range(len(exam_options)), format_func=lambda i: exam_options[i])
+                    exam_row = exams_df.iloc[selected_exam_idx]
+                    tracking_date = pd.to_datetime(exam_row["exam_date"]).date()
+                    days_left = max((tracking_date - today).days, 0)
+                    is_retake = bool(exam_row.get("is_retake", 0))
+                else:
+                    # No due dates set — use defaults
+                    tracking_date = None
+                    days_left = 30  # Default for calculations
+                    is_retake = False
 
-            if is_retake:
-                st.info("**Non-timed assessment** — Lectures not included in readiness calculations.")
+                if is_retake:
+                    st.info("**Non-timed assessment** — Lectures not included in readiness calculations.")
 
-            topics_df = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id",
-                                 (user_id, course_id))
-            upcoming_lectures = read_sql("""
-                SELECT * FROM scheduled_lectures
-                WHERE user_id=? AND course_id=? AND lecture_date >= ?
-                ORDER BY lecture_date LIMIT 10
-            """, (user_id, course_id, str(today)))
+                topics_df = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id",
+                                     (user_id, course_id))
+                upcoming_lectures = read_sql("""
+                    SELECT * FROM scheduled_lectures
+                    WHERE user_id=? AND course_id=? AND lecture_date >= ?
+                    ORDER BY lecture_date LIMIT 10
+                """, (user_id, course_id, str(today)))
 
-            # Get timed attempts data for dashboard display
-            timed_attempts_df = read_sql("""
-                SELECT * FROM timed_attempts
-                WHERE user_id=? AND course_id=?
-                ORDER BY attempt_date DESC
-            """, (user_id, course_id))
+                # Get timed attempts data for dashboard display
+                timed_attempts_df = read_sql("""
+                    SELECT * FROM timed_attempts
+                    WHERE user_id=? AND course_id=?
+                    ORDER BY attempt_date DESC
+                """, (user_id, course_id))
 
-            # Timed attempts stats
-            recent_timed = timed_attempts_df[
-                pd.to_datetime(timed_attempts_df["attempt_date"]).dt.date >= (today - timedelta(days=14))
-            ] if not timed_attempts_df.empty else pd.DataFrame()
-            latest_timed_score = timed_attempts_df.iloc[0]["score_pct"] * 100 if not timed_attempts_df.empty else None
-            timed_count_14d = len(recent_timed)
-
-            if topics_df.empty:
-                st.info("No topics added yet. Go to Topics expander to add some.")
-            else:
+                # Timed attempts stats
+                recent_timed = timed_attempts_df[
+                    pd.to_datetime(timed_attempts_df["attempt_date"]).dt.date >= (today - timedelta(days=14))
+                ] if not timed_attempts_df.empty else pd.DataFrame()
+                latest_timed_score = timed_attempts_df.iloc[0]["score_pct"] * 100 if not timed_attempts_df.empty else None
+                timed_count_14d = len(recent_timed)
                 # ============ USE CANONICAL SNAPSHOT FOR PREDICTIONS ============
                 # This ensures At-Risk, All Courses Summary, and Course Dashboard
                 # all show the SAME predicted values for the same course.
@@ -1366,10 +1362,6 @@ with tabs[0]:
                         recs = generate_recommendations(topics_scored, upcoming_lectures, days_left, today, is_retake)
                         for rec in recs:
                             st.markdown(f"- {rec}")
-
-            # ============ GATED: STUDY PLAN AND ADDITIONAL SECTIONS ============
-            # Only show when prerequisites are complete (assessments and topics exist)
-            if prereq_step is None:
                 # ============ STUDY PLAN GENERATOR ============
                 st.header("7-Day Study Plan")
 
