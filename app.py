@@ -118,15 +118,18 @@ def generate_recommendations(topics_scored: pd.DataFrame, upcoming_lectures: pd.
 
 # ============ STREAMLIT APP ============
 
+# Developer mode flag - set to True to show internal diagnostics in sidebar
+DEV_MODE = False
+
 st.set_page_config(page_title="Exam Readiness Predictor", page_icon="📈", layout="wide")
 init_db()
 
-# Show database mode indicator
+# Show database mode indicator (internal use)
 db_mode = "🐘 Postgres (Supabase)" if is_postgres() else "📁 SQLite (Local)"
 
-# ============ DATABASE DIAGNOSTICS ============
+# ============ DATABASE DIAGNOSTICS (DEV ONLY) ============
 # Display database path and status for debugging persistence issues
-if not is_postgres():
+if DEV_MODE and not is_postgres():
     from pathlib import Path
     db_path = Path(SQLITE_PATH)
     db_exists = db_path.exists()
@@ -388,7 +391,8 @@ def show_auth_page():
                         st.error(f"❌ Error during admin login: {str(e)}")
     
     st.divider()
-    st.caption(f"Database: {db_mode}")
+    if DEV_MODE:
+        st.caption(f"Database: {db_mode}")
 
 # Check if user is logged in - show auth page if not
 if st.session_state.user_id is None:
@@ -446,9 +450,10 @@ if st.session_state.is_admin:
     col3.metric("Last Month", stats["course_creators_month"])
     
     st.metric("Total Courses Created (all time)", stats["total_courses_created"])
-    
+
     st.divider()
-    st.caption(f"Database: {db_mode}")
+    if DEV_MODE:
+        st.caption(f"Database: {db_mode}")
     st.stop()
 
 # ============ LEGACY DATA CLAIM ============
@@ -676,7 +681,8 @@ with st.sidebar:
         # Generate new session_id for next login
         st.session_state.session_id = str(uuid.uuid4())
         st.rerun()
-    st.caption(f"Database: {db_mode}")
+    if DEV_MODE:
+        st.caption(f"Database: {db_mode}")
     st.divider()
     
     # Get current user_id
