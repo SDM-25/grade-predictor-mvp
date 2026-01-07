@@ -892,6 +892,52 @@ with tabs[0]:
         # ============ VIEW TOGGLE (GLOBAL vs COURSE) ============
         st.header("Dashboard")
 
+        # ============ ONBOARDING CHECKLIST ============
+        # Check setup completion for current course
+        course_exam_count = read_sql("SELECT COUNT(*) as cnt FROM exams WHERE user_id=? AND course_id=?", (user_id, course_id))
+        course_assessment_count = read_sql("SELECT COUNT(*) as cnt FROM assessments WHERE user_id=? AND course_id=?", (user_id, course_id))
+        course_topic_count = read_sql("SELECT COUNT(*) as cnt FROM topics WHERE user_id=? AND course_id=?", (user_id, course_id))
+
+        has_course_exams = course_exam_count.iloc[0]['cnt'] > 0 if not course_exam_count.empty else False
+        has_course_assessments = course_assessment_count.iloc[0]['cnt'] > 0 if not course_assessment_count.empty else False
+        has_course_topics = course_topic_count.iloc[0]['cnt'] > 0 if not course_topic_count.empty else False
+
+        setup_incomplete = not (has_course_exams and has_course_assessments and has_course_topics)
+
+        if setup_incomplete:
+            with st.container():
+                st.markdown("**Setup Checklist** — Complete these steps to get accurate predictions:")
+
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    if has_course_exams:
+                        st.markdown("~~Add exam~~ Done")
+                    else:
+                        if st.button("Add exam", key="checklist_exam", use_container_width=True):
+                            st.session_state.navigate_to_exams_tab = True
+                            st.rerun()
+
+                with col2:
+                    if has_course_assessments:
+                        st.markdown("~~Add assessment~~ Done")
+                    else:
+                        if st.button("Add assessment", key="checklist_assessment", use_container_width=True):
+                            st.session_state.expand_assessments = True
+                            st.session_state.navigate_to_exams_tab = True
+                            st.rerun()
+
+                with col3:
+                    if has_course_topics:
+                        st.markdown("~~Add topics~~ Done")
+                    else:
+                        if st.button("Add topics", key="checklist_topics", use_container_width=True):
+                            st.session_state.expand_topics = True
+                            st.session_state.navigate_to_exams_tab = True
+                            st.rerun()
+
+                st.divider()
+
         # Setup bar for quick actions
         st.session_state._setup_bar_key = 0
         render_setup_bar(user_id, course_id)
@@ -1778,7 +1824,9 @@ with tabs[1]:
             st.info("No assessments yet. Add your first one above!")
 
     # ============ TOPICS EXPANDER ============
-    with st.expander("Topics", expanded=False):
+    # Check if we should expand (from checklist navigation)
+    expand_topics = st.session_state.pop("expand_topics", False)
+    with st.expander("Topics", expanded=expand_topics):
         st.caption("Add topics covered in this course. Weight = expected exam marks for this topic.")
 
         topics_df_exp = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id",
