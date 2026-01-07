@@ -1159,14 +1159,7 @@ with tabs[0]:
             topics_scored["gap_score"] = topics_scored["weight_points"] * (1.0 - topics_scored["readiness"])
             weight_sum = float(topics_scored["weight_points"].sum()) if not topics_scored.empty else 0.0
             expected_sum = float(topics_scored["expected_points"].sum()) if not topics_scored.empty else 0.0
-            
-            # DEBUG: Show actual readiness values
-            st.write("**DEBUG - Readiness values (DIRECT CALC):**")
-            for _, row in topics_scored.iterrows():
-                m = row['mastery']
-                r = row['readiness']
-                st.write(f"  {row['topic_name']}: mastery={m:.2f}, readiness={m}/5={r:.4f} = {int(r*100)}%")
-            
+
             # Create display version with readiness as percentage string
             topics_display = topics_scored.copy()
             topics_display["Readiness %"] = topics_display["readiness"].apply(lambda x: f"{int(x * 100)}%")
