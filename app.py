@@ -940,9 +940,7 @@ with tabs[0]:
 
                 st.divider()
 
-        # Setup bar for quick actions
-        st.session_state._setup_bar_key = 0
-        render_setup_bar(user_id, course_id)
+        # NOTE: Setup bar removed from Dashboard - setup actions only in Exams tab
 
         view_col1, view_col2 = st.columns([2, 1])
         with view_col1:
