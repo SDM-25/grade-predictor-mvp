@@ -1557,6 +1557,15 @@ with tabs[1]:
     if st.session_state.pop("navigate_to_exams_tab", False):
         st.info("**Add an exam below or expand Assessments to add assessments.**")
 
+    # Show post-exam-creation success message and next step guidance
+    if "exam_created_msg" in st.session_state:
+        st.success(st.session_state.pop("exam_created_msg"))
+        next_step = st.session_state.pop("post_exam_next_step", None)
+        if next_step == "assessments":
+            st.info("**Next step:** Add an assessment below to define what you're being graded on.")
+        elif next_step == "topics":
+            st.info("**Next step:** Add topics below to track what you need to study.")
+
     exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date",
                         (user_id, course_id))
 
@@ -1576,7 +1585,28 @@ with tabs[1]:
             if exam_name.strip():
                 execute_returning("INSERT INTO exams(user_id, course_id, exam_name, exam_date, marks, is_retake) VALUES(?,?,?,?,?,?)",
                                  (user_id, course_id, exam_name.strip(), str(exam_date_input), exam_marks, 1 if is_retake_input else 0))
-                st.success(f"Exam '{exam_name}' added ({exam_marks} marks)!")
+
+                # Store success message for after rerun
+                st.session_state.exam_created_msg = f"Exam '{exam_name}' created!"
+
+                # Check next setup step and route accordingly
+                assessment_count = read_sql("SELECT COUNT(*) as cnt FROM assessments WHERE user_id=? AND course_id=?", (user_id, course_id))
+                has_assessments = assessment_count.iloc[0]['cnt'] > 0 if not assessment_count.empty else False
+
+                if not has_assessments:
+                    # Route to assessments
+                    st.session_state.expand_assessments = True
+                    st.session_state.post_exam_next_step = "assessments"
+                else:
+                    # Check for topics
+                    topic_count = read_sql("SELECT COUNT(*) as cnt FROM topics WHERE user_id=? AND course_id=?", (user_id, course_id))
+                    has_topics = topic_count.iloc[0]['cnt'] > 0 if not topic_count.empty else False
+
+                    if not has_topics:
+                        # Route to topics
+                        st.session_state.expand_topics = True
+                        st.session_state.post_exam_next_step = "topics"
+
                 st.rerun()
             else:
                 st.error("Please enter an exam name.")
