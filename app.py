@@ -841,6 +841,26 @@ target_marks = int(course_row["target_marks"]) if course_row["target_marks"] els
 st.title("📈 Exam Readiness Predictor")
 st.caption("Auto-calculated mastery from study sessions, exercises, and lectures.")
 
+# ============ SETUP BAR HELPER ============
+def render_setup_bar(user_id: int, course_id: int):
+    """Render a persistent setup bar with primary actions."""
+    # Check if current course has exams
+    course_exams = read_sql("SELECT COUNT(*) as cnt FROM exams WHERE user_id=? AND course_id=?",
+                            (user_id, course_id))
+    has_course_exams = course_exams.iloc[0]['cnt'] > 0 if not course_exams.empty else False
+
+    cols = st.columns([1, 1, 4]) if has_course_exams else st.columns([1, 5])
+    with cols[0]:
+        if st.button("➕ Add exam", key=f"setup_add_exam_{st.session_state.get('_setup_bar_key', 0)}", use_container_width=True):
+            st.session_state.navigate_to_exams_tab = True
+            st.rerun()
+    if has_course_exams:
+        with cols[1]:
+            if st.button("➕ Add assessment", key=f"setup_add_assessment_{st.session_state.get('_setup_bar_key', 0)}", use_container_width=True):
+                st.session_state.expand_assessments = True
+                st.session_state.navigate_to_exams_tab = True
+                st.rerun()
+
 # ============ TABS ============
 # Simplified 3-tab layout: Dashboard, Exams (setup), Study (log sessions)
 tabs = st.tabs(["📊 Dashboard", "📅 Exams", "📚 Study"])
@@ -871,6 +891,10 @@ with tabs[0]:
     if has_exams:
         # ============ VIEW TOGGLE (GLOBAL vs COURSE) ============
         st.subheader("📊 Dashboard")
+
+        # Setup bar for quick actions
+        st.session_state._setup_bar_key = 0
+        render_setup_bar(user_id, course_id)
 
         view_col1, view_col2 = st.columns([2, 1])
         with view_col1:
@@ -1476,15 +1500,22 @@ with tabs[0]:
 # Contains: Exams (main), Assessments, Topics, Import Topics
 with tabs[1]:
     st.subheader("📅 Exam Setup")
+
+    # Setup bar for quick actions
+    st.session_state._setup_bar_key = 1
+    render_setup_bar(user_id, course_id)
+
     st.caption("Set up your exams, assessments, and topics for this course.")
 
     # ============ EXAMS SECTION (Main - always visible) ============
     st.write("### Add Exam")
 
-    # Show highlight if navigating from empty state
+    # Show highlight if navigating from empty state or setup bar
     if st.session_state.get("navigate_to_exams", False):
         st.success("👇 **Add your first exam below to start tracking your readiness!**")
         st.session_state.navigate_to_exams = False
+    if st.session_state.pop("navigate_to_exams_tab", False):
+        st.info("👇 **Add an exam below or expand Assessments to add assessments.**")
 
     exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date",
                         (user_id, course_id))
@@ -1568,7 +1599,9 @@ with tabs[1]:
     st.divider()
 
     # ============ ASSESSMENTS EXPANDER ============
-    with st.expander("📋 Assessments", expanded=False):
+    # Check if we should expand (from setup bar navigation)
+    expand_assessments = st.session_state.pop("expand_assessments", False)
+    with st.expander("📋 Assessments", expanded=expand_assessments):
         st.caption("Define exams, assignments, projects, and quizzes. Total marks = sum of all assessments.")
 
         # Ensure default assessment exists
