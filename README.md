@@ -16,12 +16,11 @@ A study tracking app that uses spaced repetition principles and mastery decay to
 | Dashboard | Topics | Recommendations |
 |-----------|--------|-----------------|
 | <img width="958" height="435" alt="Screenshot dashboard 1" src="https://github.com/user-attachments/assets/1873cecf-db35-49bf-b914-7c48962c5db4" />
- | <img width="950" height="421" alt="image" src="https://github.com/user-attachments/assets/c07d5cfb-9584-497a-87b3-4d51f70495b5" />
- | <img width="950" height="427" alt="screnshot 3" src="https://github.com/user-attachments/assets/de812aef-38f9-40bb-b2cb-f5055def9241" />
+ |  | 
  |
-
+<img width="950" height="421" alt="image" src="https://github.com/user-attachments/assets/c07d5cfb-9584-497a-87b3-4d51f70495b5" />
 ---
-
+<img width="950" height="427" alt="screnshot 3" src="https://github.com/user-attachments/assets/de812aef-38f9-40bb-b2cb-f5055def9241" />
 ## Features
 
 ### Core Tracking
