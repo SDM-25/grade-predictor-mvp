@@ -735,40 +735,42 @@ with st.sidebar:
             course_total_marks = 120  # Fallback for display
         
         st.metric("📊 Total Marks", f"{course_total_marks}", help="Sum of all assessment marks")
-        
-        # Target settings with toggle
-        target_mode = st.radio("Target mode", ["Marks", "Percentage"], horizontal=True, key="target_mode")
-        stored_target = int(course_row["target_marks"]) if course_row["target_marks"] else 90
-        
-        if target_mode == "Marks":
-            target_marks = st.number_input("Target marks", min_value=0, max_value=course_total_marks, value=min(stored_target, course_total_marks))
-            target_pct = (target_marks / course_total_marks * 100) if course_total_marks > 0 else 0
-            st.caption(f"≈ {target_pct:.0f}%")
-        else:
-            target_pct = st.slider("Target %", min_value=0, max_value=100, value=int(stored_target / course_total_marks * 100) if course_total_marks > 0 else 75)
-            target_marks = int(course_total_marks * target_pct / 100)
-            st.caption(f"= {target_marks} marks")
-        
-        if st.button("💾 Save Target"):
-            execute("UPDATE courses SET target_marks=? WHERE id=? AND user_id=?", 
-                   (target_marks, course_id, user_id))
-            st.success("Target saved!")
-        
-        # Study plan settings
-        st.divider()
-        st.header("📅 Study Plan Settings")
-        hours_per_week = st.slider("Hours per week", min_value=1, max_value=40, value=10, 
-                                   help="How many hours can you dedicate to studying this course per week?")
-        session_length = st.selectbox("Preferred session length", 
-                                      options=[30, 45, 60, 90, 120],
-                                      index=2,
-                                      format_func=lambda x: f"{x} mins",
-                                      help="Your ideal study session duration")
-        
-        # Store in session state for dashboard access
-        st.session_state.hours_per_week = hours_per_week
-        st.session_state.session_length = session_length
-        
+
+        # Advanced settings (collapsed by default)
+        with st.expander("Advanced", expanded=False):
+            # Target settings with toggle
+            target_mode = st.radio("Target mode", ["Marks", "Percentage"], horizontal=True, key="target_mode")
+            stored_target = int(course_row["target_marks"]) if course_row["target_marks"] else 90
+
+            if target_mode == "Marks":
+                target_marks = st.number_input("Target marks", min_value=0, max_value=course_total_marks, value=min(stored_target, course_total_marks))
+                target_pct = (target_marks / course_total_marks * 100) if course_total_marks > 0 else 0
+                st.caption(f"≈ {target_pct:.0f}%")
+            else:
+                target_pct = st.slider("Target %", min_value=0, max_value=100, value=int(stored_target / course_total_marks * 100) if course_total_marks > 0 else 75)
+                target_marks = int(course_total_marks * target_pct / 100)
+                st.caption(f"= {target_marks} marks")
+
+            if st.button("💾 Save Target"):
+                execute("UPDATE courses SET target_marks=? WHERE id=? AND user_id=?",
+                       (target_marks, course_id, user_id))
+                st.success("Target saved!")
+
+            # Study plan settings
+            st.divider()
+            st.subheader("Study Plan Settings")
+            hours_per_week = st.slider("Hours per week", min_value=1, max_value=40, value=10,
+                                       help="How many hours can you dedicate to studying this course per week?")
+            session_length = st.selectbox("Preferred session length",
+                                          options=[30, 45, 60, 90, 120],
+                                          index=2,
+                                          format_func=lambda x: f"{x} mins",
+                                          help="Your ideal study session duration")
+
+            # Store in session state for dashboard access
+            st.session_state.hours_per_week = hours_per_week
+            st.session_state.session_length = session_length
+
         # Delete course section
         st.divider()
         with st.expander("🗑️ Delete Course", expanded=False):
