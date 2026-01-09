@@ -1173,6 +1173,7 @@ with tabs[0]:
                     tracking_date = pd.to_datetime(exam_row["exam_date"]).date()
                     days_left = max((tracking_date - today).days, 0)
                     is_retake = bool(exam_row.get("is_retake", 0))
+                    next_assessment_name = exam_row["exam_name"]
                 else:
                     # No due dates set — use defaults
                     tracking_date = None
