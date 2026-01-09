@@ -29,6 +29,19 @@ p, .stMarkdown {
     line-height: 1.5 !important;
 }
 
+/* Responsive Typography */
+@media (max-width: 768px) {
+    h1 { font-size: 1.5rem !important; }
+    h2 { font-size: 1.2rem !important; }
+    h3 { font-size: 1.05rem !important; }
+    p, .stMarkdown { font-size: 0.9rem !important; }
+}
+@media (max-width: 480px) {
+    h1 { font-size: 1.3rem !important; }
+    h2 { font-size: 1.1rem !important; }
+    h3 { font-size: 1rem !important; }
+}
+
 /* Card styling */
 .saas-card {
     background: rgba(255, 255, 255, 0.03);
@@ -36,6 +49,10 @@ p, .stMarkdown {
     border-radius: 12px;
     padding: 1.25rem;
     margin-bottom: 1rem;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.saas-card:hover {
+    border-color: rgba(255, 255, 255, 0.15);
 }
 .saas-card-header {
     font-size: 0.85rem;
@@ -46,6 +63,21 @@ p, .stMarkdown {
     margin-bottom: 0.75rem;
 }
 
+/* Responsive Cards */
+@media (max-width: 768px) {
+    .saas-card {
+        padding: 1rem;
+        border-radius: 10px;
+    }
+}
+@media (max-width: 480px) {
+    .saas-card {
+        padding: 0.85rem;
+        border-radius: 8px;
+        margin-bottom: 0.75rem;
+    }
+}
+
 /* KPI Card styling */
 .kpi-card {
     background: rgba(255, 255, 255, 0.04);
@@ -53,6 +85,11 @@ p, .stMarkdown {
     border-radius: 10px;
     padding: 1rem 1.25rem;
     text-align: center;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.kpi-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
 }
 .kpi-label {
     font-size: 0.75rem;
@@ -74,6 +111,91 @@ p, .stMarkdown {
     margin-top: 0.25rem;
 }
 
+/* Color-coded KPI Card variants */
+.kpi-card-success {
+    background: rgba(34, 197, 94, 0.08);
+    border-color: rgba(34, 197, 94, 0.25);
+}
+.kpi-card-success:hover {
+    border-color: rgba(34, 197, 94, 0.4);
+}
+.kpi-card-success .kpi-value {
+    color: #22c55e;
+}
+
+.kpi-card-warning {
+    background: rgba(234, 179, 8, 0.08);
+    border-color: rgba(234, 179, 8, 0.25);
+}
+.kpi-card-warning:hover {
+    border-color: rgba(234, 179, 8, 0.4);
+}
+.kpi-card-warning .kpi-value {
+    color: #eab308;
+}
+
+.kpi-card-danger {
+    background: rgba(239, 68, 68, 0.08);
+    border-color: rgba(239, 68, 68, 0.25);
+}
+.kpi-card-danger:hover {
+    border-color: rgba(239, 68, 68, 0.4);
+}
+.kpi-card-danger .kpi-value {
+    color: #ef4444;
+}
+
+.kpi-card-info {
+    background: rgba(59, 130, 246, 0.08);
+    border-color: rgba(59, 130, 246, 0.25);
+}
+.kpi-card-info:hover {
+    border-color: rgba(59, 130, 246, 0.4);
+}
+.kpi-card-info .kpi-value {
+    color: #3b82f6;
+}
+
+.kpi-card-orange {
+    background: rgba(249, 115, 22, 0.08);
+    border-color: rgba(249, 115, 22, 0.25);
+}
+.kpi-card-orange:hover {
+    border-color: rgba(249, 115, 22, 0.4);
+}
+.kpi-card-orange .kpi-value {
+    color: #f97316;
+}
+
+/* Responsive KPI Cards */
+@media (max-width: 768px) {
+    .kpi-card {
+        padding: 0.85rem 1rem;
+    }
+    .kpi-value {
+        font-size: 1.5rem;
+    }
+    .kpi-label {
+        font-size: 0.7rem;
+    }
+}
+@media (max-width: 480px) {
+    .kpi-card {
+        padding: 0.75rem 0.85rem;
+        border-radius: 8px;
+    }
+    .kpi-value {
+        font-size: 1.3rem;
+    }
+    .kpi-label {
+        font-size: 0.65rem;
+        letter-spacing: 0.3px;
+    }
+    .kpi-subtext {
+        font-size: 0.7rem;
+    }
+}
+
 /* Status badge styling */
 .status-badge {
     display: inline-block;
@@ -82,26 +204,43 @@ p, .stMarkdown {
     font-size: 0.8rem;
     font-weight: 600;
     letter-spacing: 0.3px;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.status-badge:hover {
+    transform: scale(1.02);
 }
 .status-on-track {
     background: rgba(34, 197, 94, 0.15);
     color: #22c55e;
     border: 1px solid rgba(34, 197, 94, 0.3);
+    box-shadow: 0 0 8px rgba(34, 197, 94, 0.1);
 }
 .status-borderline {
     background: rgba(234, 179, 8, 0.15);
     color: #eab308;
     border: 1px solid rgba(234, 179, 8, 0.3);
+    box-shadow: 0 0 8px rgba(234, 179, 8, 0.1);
 }
 .status-at-risk {
     background: rgba(239, 68, 68, 0.15);
     color: #ef4444;
     border: 1px solid rgba(239, 68, 68, 0.3);
+    box-shadow: 0 0 8px rgba(239, 68, 68, 0.1);
 }
 .status-early-signal {
     background: rgba(249, 115, 22, 0.15);
     color: #f97316;
     border: 1px solid rgba(249, 115, 22, 0.3);
+    box-shadow: 0 0 8px rgba(249, 115, 22, 0.1);
+}
+
+/* Responsive Status Badges */
+@media (max-width: 480px) {
+    .status-badge {
+        padding: 0.25rem 0.5rem;
+        font-size: 0.7rem;
+        border-radius: 4px;
+    }
 }
 
 /* Button styling */
@@ -109,7 +248,14 @@ p, .stMarkdown {
     border-radius: 8px !important;
     padding: 0.5rem 1.25rem !important;
     font-weight: 500 !important;
-    transition: all 0.15s ease !important;
+    transition: all 0.2s ease !important;
+}
+.stButton > button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+.stButton > button:active {
+    transform: translateY(0);
 }
 .stButton > button[kind="primary"] {
     background: #ef4444 !important;
@@ -117,6 +263,15 @@ p, .stMarkdown {
 }
 .stButton > button[kind="primary"]:hover {
     background: #dc2626 !important;
+    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
+}
+
+/* Responsive Buttons */
+@media (max-width: 480px) {
+    .stButton > button {
+        padding: 0.45rem 1rem !important;
+        font-size: 0.85rem !important;
+    }
 }
 
 /* Empty state card */
@@ -142,6 +297,20 @@ p, .stMarkdown {
     line-height: 1.5;
 }
 
+/* Responsive Empty State */
+@media (max-width: 480px) {
+    .empty-state-card {
+        padding: 1.75rem 1.25rem;
+        margin: 1rem auto;
+    }
+    .empty-state-title {
+        font-size: 1.1rem;
+    }
+    .empty-state-desc {
+        font-size: 0.85rem;
+    }
+}
+
 /* Setup checklist card */
 .setup-card {
     background: rgba(239, 68, 68, 0.08);
@@ -149,6 +318,10 @@ p, .stMarkdown {
     border-radius: 12px;
     padding: 1.25rem;
     margin-bottom: 1.5rem;
+    transition: border-color 0.2s ease;
+}
+.setup-card:hover {
+    border-color: rgba(239, 68, 68, 0.35);
 }
 .setup-card-header {
     font-size: 0.95rem;
@@ -161,13 +334,25 @@ p, .stMarkdown {
     align-items: center;
     padding: 0.4rem 0;
     font-size: 0.9rem;
+    transition: background-color 0.15s ease;
 }
 .setup-item-done {
-    color: rgba(255, 255, 255, 0.45);
-    text-decoration: line-through;
+    color: #22c55e;
+    text-decoration: none;
+    opacity: 0.7;
 }
 .setup-item-pending {
     color: rgba(255, 255, 255, 0.85);
+}
+
+/* Responsive Setup Card */
+@media (max-width: 480px) {
+    .setup-card {
+        padding: 1rem;
+    }
+    .setup-item {
+        font-size: 0.85rem;
+    }
 }
 
 /* Action list styling */
@@ -178,6 +363,10 @@ p, .stMarkdown {
 .action-item {
     padding: 0.6rem 0;
     border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    transition: background-color 0.15s ease;
+}
+.action-item:hover {
+    background-color: rgba(255, 255, 255, 0.02);
 }
 .action-item:last-child {
     border-bottom: none;
@@ -190,15 +379,47 @@ p, .stMarkdown {
 }
 .action-label {
     display: inline-block;
-    background: rgba(255, 255, 255, 0.08);
     padding: 0.15rem 0.4rem;
     border-radius: 4px;
     font-size: 0.7rem;
-    font-weight: 500;
-    color: rgba(255, 255, 255, 0.6);
+    font-weight: 600;
     margin-right: 0.4rem;
     text-transform: uppercase;
+    letter-spacing: 0.3px;
 }
+
+/* Color-coded action labels by type */
+.action-label-due {
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+.action-label-practice {
+    background: rgba(59, 130, 246, 0.15);
+    color: #3b82f6;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+}
+.action-label-review {
+    background: rgba(168, 85, 247, 0.15);
+    color: #a855f7;
+    border: 1px solid rgba(168, 85, 247, 0.3);
+}
+.action-label-exercises {
+    background: rgba(34, 197, 94, 0.15);
+    color: #22c55e;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+}
+.action-label-setup {
+    background: rgba(234, 179, 8, 0.15);
+    color: #eab308;
+    border: 1px solid rgba(234, 179, 8, 0.3);
+}
+.action-label-default {
+    background: rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
 .action-text {
     color: rgba(255, 255, 255, 0.9);
     font-size: 0.9rem;
@@ -208,6 +429,24 @@ p, .stMarkdown {
     font-size: 0.8rem;
     color: rgba(255, 255, 255, 0.45);
     margin-top: 0.2rem;
+}
+
+/* Responsive Action List */
+@media (max-width: 480px) {
+    .action-item {
+        padding: 0.5rem 0;
+    }
+    .action-label {
+        font-size: 0.6rem;
+        padding: 0.1rem 0.3rem;
+    }
+    .action-text {
+        font-size: 0.85rem;
+    }
+    .action-detail {
+        font-size: 0.75rem;
+        margin-left: 1.25rem;
+    }
 }
 
 /* Table styling */
@@ -226,6 +465,60 @@ p, .stMarkdown {
     font-size: 0.8rem;
     color: rgba(255, 255, 255, 0.5);
     margin-top: 0.5rem;
+}
+
+/* Progress indicator colors */
+.progress-high {
+    color: #22c55e;
+}
+.progress-medium {
+    color: #eab308;
+}
+.progress-low {
+    color: #ef4444;
+}
+
+/* Urgency indicators */
+.urgency-critical {
+    color: #ef4444;
+    font-weight: 600;
+}
+.urgency-warning {
+    color: #eab308;
+    font-weight: 500;
+}
+.urgency-normal {
+    color: #22c55e;
+}
+
+/* Global responsive layout helpers */
+@media (max-width: 768px) {
+    /* Stack columns on tablet */
+    [data-testid="column"] {
+        width: 100% !important;
+        flex: 1 1 100% !important;
+    }
+    .section-spacer {
+        margin-top: 1.5rem;
+    }
+}
+@media (max-width: 480px) {
+    /* Tighter spacing on mobile */
+    .section-spacer {
+        margin-top: 1rem;
+    }
+    /* Better touch targets */
+    .stButton > button {
+        min-height: 44px !important;
+    }
+    .stSelectbox > div > div {
+        min-height: 44px !important;
+    }
+}
+
+/* Smooth transitions for all interactive elements */
+* {
+    -webkit-tap-highlight-color: transparent;
 }
 </style>
 """
@@ -254,7 +547,7 @@ def render_card(title: str, content_fn, card_class: str = "saas-card"):
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-def metric_card(label: str, value: str, subtext: str = None) -> str:
+def metric_card(label: str, value: str, subtext: str = None, variant: str = None) -> str:
     """
     Generate HTML for a KPI metric card.
 
@@ -262,13 +555,15 @@ def metric_card(label: str, value: str, subtext: str = None) -> str:
         label: Small label text above the value
         value: Large main value
         subtext: Optional small text below the value
+        variant: Color variant - 'success', 'warning', 'danger', 'info', 'orange', or None
 
     Returns:
         HTML string for the metric card
     """
     subtext_html = f'<div class="kpi-subtext">{subtext}</div>' if subtext else ''
+    variant_class = f' kpi-card-{variant}' if variant else ''
     return f'''
-    <div class="kpi-card">
+    <div class="kpi-card{variant_class}">
         <div class="kpi-label">{label}</div>
         <div class="kpi-value">{value}</div>
         {subtext_html}
@@ -281,13 +576,14 @@ def render_kpi_row(metrics: list):
     Render a row of KPI metric cards.
 
     Args:
-        metrics: List of dicts with keys: label, value, subtext (optional)
+        metrics: List of dicts with keys: label, value, subtext (optional), variant (optional)
+                 variant can be: 'success', 'warning', 'danger', 'info', 'orange'
     """
     cols = st.columns(len(metrics))
     for col, m in zip(cols, metrics):
         with col:
             st.markdown(
-                metric_card(m['label'], m['value'], m.get('subtext')),
+                metric_card(m['label'], m['value'], m.get('subtext'), m.get('variant')),
                 unsafe_allow_html=True
             )
 
@@ -380,30 +676,34 @@ def render_setup_checklist(items: list):
 
 def render_action_list(tasks: list, max_items: int = 5):
     """
-    Render a styled action list.
+    Render a styled action list with color-coded labels.
 
     Args:
         tasks: List of task dicts with: task_type, title, detail, est_minutes (optional)
         max_items: Maximum number of items to show
     """
-    task_type_labels = {
-        'assessment_due': 'Due',
-        'timed_attempt': 'Practice',
-        'review_topic': 'Review',
-        'do_exercises': 'Exercises',
-        'setup_missing': 'Setup'
+    # Map task types to labels and color classes
+    task_type_config = {
+        'assessment_due': ('Due', 'action-label-due'),
+        'timed_attempt': ('Practice', 'action-label-practice'),
+        'review_topic': ('Review', 'action-label-review'),
+        'do_exercises': ('Exercises', 'action-label-exercises'),
+        'setup_missing': ('Setup', 'action-label-setup')
     }
 
     st.markdown('<div class="action-list">', unsafe_allow_html=True)
 
     for i, task in enumerate(tasks[:max_items]):
-        label = task_type_labels.get(task['task_type'], '')
+        label, label_class = task_type_config.get(
+            task['task_type'],
+            (task['task_type'].replace('_', ' ').title(), 'action-label-default')
+        )
         time_info = f" ({task['est_minutes']}min)" if task.get('est_minutes') else ""
 
         st.markdown(f'''
         <div class="action-item">
             <span class="action-number">{i+1}.</span>
-            <span class="action-label">{label}</span>
+            <span class="action-label {label_class}">{label}</span>
             <span class="action-text">{task['title']}{time_info}</span>
             <div class="action-detail">{task['detail']}</div>
         </div>

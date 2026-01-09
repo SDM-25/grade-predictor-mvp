@@ -1246,29 +1246,56 @@ with tabs[0]:
                 maturity_reason = snapshot.get('maturity_reason', '')
                 confidence_label = {"EARLY": "Early", "MID": "Mid", "LATE": "Late"}.get(maturity_tier, "Mid")
 
+                # Determine color variants based on status
+                status = snapshot['status']
+                status_variant_map = {
+                    'on_track': 'success',
+                    'borderline': 'warning',
+                    'at_risk': 'danger',
+                    'early_signal': 'orange'
+                }
+                predicted_variant = status_variant_map.get(status)
+
+                # Readiness color based on percentage
+                readiness_val = retention_pct * 100
+                if readiness_val >= 70:
+                    readiness_variant = 'success'
+                elif readiness_val >= 40:
+                    readiness_variant = 'warning'
+                else:
+                    readiness_variant = 'danger'
+
+                # Days left color based on urgency
+                if tracking_date and days_left <= 7:
+                    days_variant = 'danger'
+                elif tracking_date and days_left <= 14:
+                    days_variant = 'warning'
+                elif tracking_date and days_left <= 30:
+                    days_variant = 'orange'
+                else:
+                    days_variant = 'info'
+
                 kpi_metrics = [
                     {
                         'label': 'Predicted',
                         'value': f"{pred_marks:.0f}/{total_marks}",
-                        'subtext': f"Target: {target_marks}"
+                        'subtext': f"Target: {target_marks}",
+                        'variant': predicted_variant
                     },
                     {
                         'label': 'Readiness',
                         'value': f"{retention_pct*100:.0f}%",
-                        'subtext': f"Confidence: {confidence_label}"
+                        'subtext': f"Confidence: {confidence_label}",
+                        'variant': readiness_variant
                     },
                     {
                         'label': 'Days Left',
                         'value': f"{days_left}" if tracking_date else "N/A",
-                        'subtext': next_assessment_name[:20] + "..." if next_assessment_name and len(next_assessment_name) > 20 else (next_assessment_name or "No due date")
-                    },
-                    {
-                        'label': 'Status',
-                        'value': '',  # Will be replaced with badge
-                        'subtext': ''
+                        'subtext': next_assessment_name[:20] + "..." if next_assessment_name and len(next_assessment_name) > 20 else (next_assessment_name or "No due date"),
+                        'variant': days_variant if tracking_date else None
                     },
                 ]
-                render_kpi_row(kpi_metrics[:3])
+                render_kpi_row(kpi_metrics)
 
                 # Status badge (rendered separately for HTML badge styling)
                 st.markdown(f"""
