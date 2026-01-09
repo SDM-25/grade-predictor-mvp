@@ -243,27 +243,77 @@ p, .stMarkdown {
     }
 }
 
-/* Button styling */
+/* Button styling - Dark SaaS style with polished animations */
 .stButton > button {
     border-radius: 8px !important;
     padding: 0.5rem 1.25rem !important;
     font-weight: 500 !important;
-    transition: all 0.2s ease !important;
+    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    position: relative !important;
 }
 .stButton > button:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+    transform: translateY(-2px) !important;
+    border-color: rgba(255, 255, 255, 0.25) !important;
+    box-shadow:
+        0 4px 12px rgba(0, 0, 0, 0.3),
+        0 0 20px rgba(255, 255, 255, 0.05) !important;
 }
 .stButton > button:active {
-    transform: translateY(0);
+    transform: translateY(0) scale(0.98) !important;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2) !important;
+    transition: all 0.1s ease !important;
 }
+
+/* Primary button variant - Red accent with glow */
 .stButton > button[kind="primary"] {
-    background: #ef4444 !important;
-    border: none !important;
+    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;
+    border: 1px solid rgba(239, 68, 68, 0.3) !important;
+    box-shadow: 0 2px 8px rgba(239, 68, 68, 0.15) !important;
 }
 .stButton > button[kind="primary"]:hover {
-    background: #dc2626 !important;
-    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
+    background: linear-gradient(135deg, #f87171 0%, #ef4444 100%) !important;
+    border-color: rgba(248, 113, 113, 0.5) !important;
+    box-shadow:
+        0 6px 20px rgba(239, 68, 68, 0.35),
+        0 0 30px rgba(239, 68, 68, 0.15),
+        inset 0 1px 0 rgba(255, 255, 255, 0.1) !important;
+}
+.stButton > button[kind="primary"]:active {
+    background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%) !important;
+    box-shadow:
+        0 2px 8px rgba(239, 68, 68, 0.25),
+        inset 0 2px 4px rgba(0, 0, 0, 0.1) !important;
+}
+
+/* Form submit buttons - same primary styling */
+.stFormSubmitButton > button {
+    border-radius: 8px !important;
+    padding: 0.5rem 1.25rem !important;
+    font-weight: 500 !important;
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+.stFormSubmitButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;
+    border: 1px solid rgba(239, 68, 68, 0.3) !important;
+    box-shadow: 0 2px 8px rgba(239, 68, 68, 0.15) !important;
+}
+.stFormSubmitButton > button[kind="primary"]:hover {
+    transform: translateY(-2px) !important;
+    background: linear-gradient(135deg, #f87171 0%, #ef4444 100%) !important;
+    border-color: rgba(248, 113, 113, 0.5) !important;
+    box-shadow:
+        0 6px 20px rgba(239, 68, 68, 0.35),
+        0 0 30px rgba(239, 68, 68, 0.15),
+        inset 0 1px 0 rgba(255, 255, 255, 0.1) !important;
+}
+.stFormSubmitButton > button[kind="primary"]:active {
+    transform: translateY(0) scale(0.98) !important;
+    background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%) !important;
+    box-shadow:
+        0 2px 8px rgba(239, 68, 68, 0.25),
+        inset 0 2px 4px rgba(0, 0, 0, 0.1) !important;
+    transition: all 0.1s ease !important;
 }
 
 /* Responsive Buttons */
