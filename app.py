@@ -1338,6 +1338,9 @@ with tabs[0]:
                 # Create display version with readiness as percentage string
                 topics_display = topics_scored.copy()
                 topics_display["Readiness %"] = topics_display["readiness"].apply(lambda x: f"{int(x * 100)}%")
+                topics_display["last_activity"] = topics_display["last_activity"].apply(
+                    lambda x: x.strftime("%d.%m.%Y") if x is not None else "—"
+                )
 
                 # ============ PER-ASSESSMENT BREAKDOWN ============
                 section_header("Assessment Breakdown")
