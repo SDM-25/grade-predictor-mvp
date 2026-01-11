@@ -183,6 +183,15 @@ if "navigate_to_exams" not in st.session_state:
 if "navigate_to_topics" not in st.session_state:
     st.session_state.navigate_to_topics = False
 
+# Data version for cache invalidation - increments after any write operation
+# This forces widgets with keys containing data_version to refresh their state
+if "data_version" not in st.session_state:
+    st.session_state.data_version = 0
+
+def invalidate_data():
+    """Increment data_version to invalidate cached reads and widget states."""
+    st.session_state.data_version += 1
+
 # ============ AUTO-LOGIN WITH PERSISTENT TOKEN ============
 # Initialize cookie manager
 if HAS_COOKIE_MANAGER:
@@ -1030,7 +1039,7 @@ def render_topics_manager(user_id: int, course_id: int, show_import: bool = True
             },
             use_container_width=True,
             hide_index=True,
-            key=f"topics_editor{form_key_suffix}"
+            key=f"topics_editor{form_key_suffix}_{st.session_state.data_version}"
         )
 
         col1, col2 = st.columns(2)
@@ -1041,6 +1050,7 @@ def render_topics_manager(user_id: int, course_id: int, show_import: bool = True
                         execute("UPDATE topics SET topic_name=?, weight_points=?, notes=? WHERE id=? AND user_id=?",
                                (r["topic_name"], float(r["weight_points"]), r.get("notes"), int(r["id"]), user_id))
                 st.success("Topics updated!")
+                invalidate_data()
                 st.rerun()
         with col2:
             topic_to_delete = st.selectbox("Delete topic", topics_df["topic_name"].tolist(), key=f"del_topic{form_key_suffix}")
@@ -1050,6 +1060,7 @@ def render_topics_manager(user_id: int, course_id: int, show_import: bool = True
                 execute("DELETE FROM exercises WHERE topic_id=?", (int(topic_id_del),))
                 execute("DELETE FROM topics WHERE id=? AND user_id=?", (int(topic_id_del), user_id))
                 st.success("Topic and related data deleted!")
+                invalidate_data()
                 st.rerun()
 
     # Import topics from PDF section
@@ -2147,7 +2158,7 @@ with tabs[1]:
             },
             use_container_width=True,
             hide_index=True,
-            key="exams_editor"
+            key=f"exams_editor_{st.session_state.data_version}"
         )
 
         col1, col2 = st.columns(2)
@@ -2162,6 +2173,7 @@ with tabs[1]:
                              int(row["marks"]), actual, 1 if row["is_retake"] else 0, int(row["id"]), user_id)
                         )
                 st.success("Exams updated!")
+                invalidate_data()  # Force refresh of all cached data
                 st.rerun()
         with col2:
             if st.button("Delete Selected Exams"):
@@ -2170,6 +2182,7 @@ with tabs[1]:
                     for eid in to_delete:
                         execute("DELETE FROM exams WHERE id=? AND user_id=?", (int(eid), user_id))
                     st.success(f"Deleted {len(to_delete)} exam(s)!")
+                    invalidate_data()  # Force refresh of all cached data
                     st.rerun()
 
     st.divider()
@@ -2253,7 +2266,7 @@ with tabs[1]:
                 },
                 use_container_width=True,
                 hide_index=True,
-                key="assessments_editor"
+                key=f"assessments_editor_{st.session_state.data_version}"
             )
 
             col1, col2 = st.columns(2)
@@ -2271,6 +2284,7 @@ with tabs[1]:
                                  actual, progress, due_str, 1 if row["is_timed"] else 0, row["notes"], int(row["id"]), user_id)
                             )
                     st.success("Changes saved!")
+                    invalidate_data()
                     st.rerun()
             with col2:
                 if st.button("Delete Selected Assessments"):
@@ -2279,6 +2293,7 @@ with tabs[1]:
                         for aid in to_delete:
                             execute("DELETE FROM assessments WHERE id=? AND user_id=?", (int(aid), user_id))
                         st.success(f"Deleted {len(to_delete)} assessment(s)!")
+                        invalidate_data()
                         st.rerun()
         
         # ============ ASSIGNMENT WORK TRACKING ============
@@ -2435,7 +2450,7 @@ with tabs[3]:
                     },
                     use_container_width=True,
                     hide_index=True,
-                    key="sessions_editor"
+                    key=f"sessions_editor_{st.session_state.data_version}"
                 )
 
                 if st.button("Delete Selected Sessions"):
@@ -2444,6 +2459,7 @@ with tabs[3]:
                         for sid in to_delete:
                             execute("DELETE FROM study_sessions WHERE id=?", (int(sid),))
                         st.success(f"Deleted {len(to_delete)} session(s)!")
+                        invalidate_data()
                         st.rerun()
 
     # ============ EXERCISES EXPANDER ============
@@ -2500,7 +2516,7 @@ with tabs[3]:
                     },
                     use_container_width=True,
                     hide_index=True,
-                    key="exercises_editor"
+                    key=f"exercises_editor_{st.session_state.data_version}"
                 )
 
                 if st.button("Delete Selected Exercises"):
@@ -2509,6 +2525,7 @@ with tabs[3]:
                         for eid in to_delete:
                             execute("DELETE FROM exercises WHERE id=?", (int(eid),))
                         st.success(f"Deleted {len(to_delete)} exercise(s)!")
+                        invalidate_data()
                         st.rerun()
 
     # ============ TIMED ATTEMPTS EXPANDER ============
@@ -2585,7 +2602,7 @@ with tabs[3]:
                 },
                 use_container_width=True,
                 hide_index=True,
-                key="timed_attempts_editor"
+                key=f"timed_attempts_editor_{st.session_state.data_version}"
             )
 
             if st.button("Delete Selected Attempts"):
@@ -2594,6 +2611,7 @@ with tabs[3]:
                     for tid in to_delete:
                         execute("DELETE FROM timed_attempts WHERE id=? AND user_id=?", (int(tid), user_id))
                     st.success(f"Deleted {len(to_delete)} attempt(s)!")
+                    invalidate_data()
                     st.rerun()
 
             # Stats summary
@@ -2667,7 +2685,7 @@ with tabs[3]:
                     },
                     use_container_width=True,
                     hide_index=True,
-                    key="upcoming_lectures"
+                    key=f"upcoming_lectures_{st.session_state.data_version}"
                 )
 
                 if st.button("Save Upcoming Lecture Changes"):
@@ -2675,6 +2693,7 @@ with tabs[3]:
                         execute("UPDATE scheduled_lectures SET lecture_date=?, lecture_time=?, topics_planned=?, notes=? WHERE id=? AND user_id=?",
                                (pd.to_datetime(r["lecture_date"]).strftime("%Y-%m-%d"), r["lecture_time"], r["topics_planned"], r.get("notes"), int(r["id"]), user_id))
                     st.success("Updated!")
+                    invalidate_data()
                     st.rerun()
             else:
                 st.info("No upcoming lectures scheduled.")
@@ -2696,7 +2715,7 @@ with tabs[3]:
                     },
                     use_container_width=True,
                     hide_index=True,
-                    key="past_lectures"
+                    key=f"past_lectures_{st.session_state.data_version}"
                 )
 
                 if st.button("Save Attendance"):
@@ -2704,6 +2723,7 @@ with tabs[3]:
                         execute("UPDATE scheduled_lectures SET attended=? WHERE id=? AND user_id=?",
                                (1 if r["attended"] else 0, int(r["id"]), user_id))
                     st.success("Attendance saved! Mastery updated.")
+                    invalidate_data()
                     st.rerun()
             else:
                 st.info("No past lectures.")
@@ -2716,6 +2736,7 @@ with tabs[3]:
                 lec_id = int(lectures_df.iloc[lec_idx]["id"])
                 execute("DELETE FROM scheduled_lectures WHERE id=? AND user_id=?", (lec_id, user_id))
                 st.success("Lecture deleted!")
+                invalidate_data()
                 st.rerun()
         else:
             st.info("No lectures scheduled yet. Add one above!")
