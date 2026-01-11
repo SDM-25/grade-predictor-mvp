@@ -49,8 +49,7 @@ from dashboard_helpers import (
 # Import UI components
 from ui import (
     inject_css, render_kpi_row, status_badge, render_empty_state,
-    render_setup_checklist, render_action_list, section_header,
-    card_start, card_end
+    render_action_list, section_header, card_start, card_end
 )
 
 # Import metric computation functions (NO Streamlit UI dependencies)
@@ -975,20 +974,33 @@ with tabs[0]:
         setup_incomplete = not (has_course_exams and has_course_assessments and has_course_topics)
 
         if setup_incomplete:
+            # Inline setup checklist with direct dialog calls
+            st.markdown("**Complete Setup**")
             setup_items = [
-                {'label': 'Add exam', 'done': has_course_exams, 'button_key': 'checklist_exam'},
-                {'label': 'Add assessment', 'done': has_course_assessments, 'button_key': 'checklist_assessment'},
-                {'label': 'Add topics', 'done': has_course_topics, 'button_key': 'checklist_topics'},
+                ('Add exam', has_course_exams, 'checklist_exam'),
+                ('Add assessment', has_course_assessments, 'checklist_assessment'),
+                ('Add topics', has_course_topics, 'checklist_topics'),
             ]
-            clicked = render_setup_checklist(setup_items)
-            if clicked == 'checklist_exam':
-                add_exam_dialog()
-            elif clicked == 'checklist_assessment':
-                add_assessment_dialog()
-            elif clicked == 'checklist_topics':
-                st.session_state.expand_topics = True
-                st.session_state.navigate_to_exams_tab = True
-                st.rerun()
+            for label, done, key in setup_items:
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    if done:
+                        st.markdown(f":white_check_mark: ~~{label}~~")
+                    else:
+                        st.markdown(f":white_circle: {label}")
+                with col2:
+                    if not done:
+                        if key == 'checklist_exam':
+                            if st.button("Add", key=key, use_container_width=True):
+                                add_exam_dialog()
+                        elif key == 'checklist_assessment':
+                            if st.button("Add", key=key, use_container_width=True):
+                                add_assessment_dialog()
+                        elif key == 'checklist_topics':
+                            if st.button("Add", key=key, use_container_width=True):
+                                st.session_state.expand_topics = True
+                                st.session_state.navigate_to_exams_tab = True
+                                st.rerun()
             st.markdown("")
 
         # NOTE: Setup bar removed from Dashboard - setup actions only in Exams tab
