@@ -177,9 +177,11 @@ if "hours_per_week" not in st.session_state:
 if "session_length" not in st.session_state:
     st.session_state.session_length = 60
 
-# Empty state navigation flag
+# Empty state navigation flags
 if "navigate_to_exams" not in st.session_state:
     st.session_state.navigate_to_exams = False
+if "navigate_to_topics" not in st.session_state:
+    st.session_state.navigate_to_topics = False
 
 # ============ AUTO-LOGIN WITH PERSISTENT TOKEN ============
 # Initialize cookie manager
@@ -983,9 +985,319 @@ def render_setup_bar(user_id: int, course_id: int):
             if st.button("Add assessment", key=f"setup_add_assessment_{st.session_state.get('_setup_bar_key', 0)}", use_container_width=True):
                 add_assessment_dialog()
 
+# ============ TOPICS MANAGER HELPER ============
+def render_topics_manager(user_id: int, course_id: int, show_import: bool = True, form_key_suffix: str = ""):
+    """
+    Render the full topics management UI.
+    Reusable component for Topics tab and anywhere else topics need to be managed.
+
+    Args:
+        user_id: Current user ID
+        course_id: Current course ID
+        show_import: Whether to show the PDF import section
+        form_key_suffix: Suffix for form keys to avoid conflicts when rendered in multiple places
+    """
+    st.caption("Add topics covered in this course. Weight = expected exam marks for this topic.")
+
+    topics_df = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id",
+                         (user_id, course_id))
+
+    # Add topic form
+    with st.form(f"add_topic{form_key_suffix}"):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            topic_name_input = st.text_input("Topic name", placeholder="e.g., Supply and Demand")
+        with col2:
+            weight_input = st.number_input("Weight (points)", min_value=0, value=10)
+
+        if st.form_submit_button("Add Topic"):
+            if topic_name_input.strip():
+                execute_returning("INSERT INTO topics(user_id, course_id, topic_name, weight_points) VALUES(?,?,?,?)",
+                                 (user_id, course_id, topic_name_input.strip(), weight_input))
+                st.success("Topic added!")
+                st.rerun()
+
+    # Existing topics editor
+    if not topics_df.empty:
+        st.write("**Existing Topics:**")
+        edited_topics = st.data_editor(
+            topics_df,
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "topic_name": st.column_config.TextColumn("Topic Name", width="large"),
+                "weight_points": st.column_config.NumberColumn("Weight", min_value=0),
+                "notes": st.column_config.TextColumn("Notes"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key=f"topics_editor{form_key_suffix}"
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Save Topic Changes", key=f"save_topics{form_key_suffix}"):
+                for _, r in edited_topics.iterrows():
+                    if pd.notna(r["id"]):
+                        execute("UPDATE topics SET topic_name=?, weight_points=?, notes=? WHERE id=? AND user_id=?",
+                               (r["topic_name"], float(r["weight_points"]), r.get("notes"), int(r["id"]), user_id))
+                st.success("Topics updated!")
+                st.rerun()
+        with col2:
+            topic_to_delete = st.selectbox("Delete topic", topics_df["topic_name"].tolist(), key=f"del_topic{form_key_suffix}")
+            if st.button("Delete Selected Topic", key=f"delete_topic_btn{form_key_suffix}"):
+                topic_id_del = topics_df.loc[topics_df["topic_name"] == topic_to_delete, "id"].iloc[0]
+                execute("DELETE FROM study_sessions WHERE topic_id=?", (int(topic_id_del),))
+                execute("DELETE FROM exercises WHERE topic_id=?", (int(topic_id_del),))
+                execute("DELETE FROM topics WHERE id=? AND user_id=?", (int(topic_id_del), user_id))
+                st.success("Topic and related data deleted!")
+                st.rerun()
+
+    # Import topics from PDF section
+    if show_import:
+        st.divider()
+        st.write("### Import Topics from PDF")
+        st.caption("Upload lecture slide PDFs to automatically extract topic names.")
+
+        if not HAS_PYMUPDF:
+            st.warning("PDF extraction requires PyMuPDF. Install with: `pip install pymupdf`")
+        else:
+            # Initialize session state for imported topics
+            if "imported_topics" not in st.session_state:
+                st.session_state.imported_topics = None
+            if "import_stats" not in st.session_state:
+                st.session_state.import_stats = None
+
+            # File uploader
+            st.write("**Step 1: Upload PDF Files**")
+            uploaded_files = st.file_uploader(
+                "Select lecture slide PDFs",
+                type=["pdf"],
+                accept_multiple_files=True,
+                help="Upload one or more PDF files containing lecture slides",
+                key=f"pdf_uploader{form_key_suffix}"
+            )
+
+            if uploaded_files:
+                st.caption(f"{len(uploaded_files)} file(s) selected")
+
+                # SECURITY: File size validation
+                from security import MAX_PDF_SIZE, MAX_TOTAL_UPLOAD_SIZE, validate_pdf_header, sanitize_filename
+                max_file_mb = MAX_PDF_SIZE / (1024 * 1024)
+                max_total_mb = MAX_TOTAL_UPLOAD_SIZE / (1024 * 1024)
+
+                # Check file sizes before processing
+                total_size = 0
+                file_errors = []
+                for f in uploaded_files:
+                    f.seek(0, 2)  # Seek to end
+                    file_size = f.tell()
+                    f.seek(0)  # Reset to start
+                    total_size += file_size
+
+                    if file_size > MAX_PDF_SIZE:
+                        safe_name = sanitize_filename(f.name)
+                        file_errors.append(f"{safe_name}: {file_size / (1024*1024):.1f}MB exceeds {max_file_mb:.0f}MB limit")
+
+                if total_size > MAX_TOTAL_UPLOAD_SIZE:
+                    file_errors.append(f"Total upload size {total_size / (1024*1024):.1f}MB exceeds {max_total_mb:.0f}MB limit")
+
+                if file_errors:
+                    for err in file_errors:
+                        st.error(err)
+                else:
+                    # Extract topics button
+                    if st.button("Extract Topics", type="primary", key=f"extract_topics{form_key_suffix}"):
+                        with st.spinner("Extracting topics from PDFs..."):
+                            # Validate PDF headers and read files
+                            pdf_files = []
+                            validation_errors = []
+                            for f in uploaded_files:
+                                content = f.read()
+                                if not validate_pdf_header(content):
+                                    safe_name = sanitize_filename(f.name)
+                                    validation_errors.append(f"{safe_name}: Invalid PDF file")
+                                else:
+                                    pdf_files.append((content, sanitize_filename(f.name)))
+                                f.seek(0)
+
+                            if validation_errors:
+                                for err in validation_errors:
+                                    st.error(err)
+                            elif pdf_files:
+                                try:
+                                    candidates, stats = extract_and_process_topics(pdf_files)
+                                    st.session_state.imported_topics = candidates
+                                    st.session_state.import_stats = stats
+                                    st.success("Extraction complete!")
+                                except Exception as e:
+                                    st.error(f"Error extracting topics: {e}")
+                                    st.session_state.imported_topics = None
+
+            # Show extraction results
+            if st.session_state.imported_topics is not None:
+                stats = st.session_state.import_stats
+
+                st.divider()
+                st.write("**Extraction Summary:**")
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Files Processed", stats["files_processed"])
+                col2.metric("Pages Scanned", stats["total_pages"])
+                col3.metric("Topics Found", stats.get("final_topics", stats.get("final_candidates", 0)))
+                col4.metric("Adaptive Cap", stats.get("adaptive_cap", "N/A"))
+
+                # Detailed extraction pipeline stats
+                with st.expander("Extraction Pipeline Details"):
+                    st.caption("How topics were filtered at each stage:")
+                    st.write(f"1. **Raw candidates extracted:** {stats.get('raw_candidates', stats.get('initial_candidates', 0))}")
+                    st.write(f"2. **After header filter (>10% of pages removed):** {stats.get('after_header_filter', 'N/A')}")
+                    st.write(f"3. **After frequency filter (min 2 or 3% pages):** {stats.get('after_frequency_filter', 'N/A')}")
+                    st.write(f"4. **After similarity clustering (90% threshold):** {stats.get('after_clustering', 'N/A')}")
+                    st.write(f"5. **After hierarchical merge:** {stats.get('after_hierarchical_merge', 'N/A')}")
+                    st.write(f"6. **Final topics (ranked & capped):** {stats.get('final_topics', stats.get('final_candidates', 0))}")
+
+                    reduction_pct = 0
+                    initial = stats.get('raw_candidates', stats.get('initial_candidates', 0))
+                    final = stats.get('final_topics', stats.get('final_candidates', 0))
+                    if initial > 0:
+                        reduction_pct = round((1 - final / initial) * 100, 1)
+                    st.success(f"Reduced by {reduction_pct}% ({initial} → {final} topics)")
+
+                # Show subtopics if available
+                if stats.get("subtopics") and len(stats["subtopics"]) > 0:
+                    show_subtopics = st.checkbox(
+                        f"Show {len(stats['subtopics'])} subtopic(s) that were merged into parent topics",
+                        value=False,
+                        key=f"show_subtopics{form_key_suffix}"
+                    )
+                    if show_subtopics:
+                        st.caption("These topics were merged hierarchically (e.g., 'Topic I: Part A' → 'Topic')")
+                        subtopics_df = pd.DataFrame(stats["subtopics"])
+                        st.dataframe(
+                            subtopics_df[["topic_name", "parent_topic"]],
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                st.divider()
+                st.write("**Step 2: Review & Edit Topics**")
+                st.caption("Check topics to include, edit names as needed.")
+
+                # Convert to DataFrame for editing
+                if st.session_state.imported_topics:
+                    import_df = pd.DataFrame(st.session_state.imported_topics)
+                    import_df["include"] = True
+
+                    # Handle both old (confidence) and new (occurrence_count) format
+                    if "occurrence_count" in import_df.columns:
+                        import_df["frequency"] = import_df["occurrence_count"]
+                    elif "confidence" in import_df.columns:
+                        import_df["frequency"] = import_df["confidence"].round(2)
+                    else:
+                        import_df["frequency"] = 1
+
+                    # Get existing topics to check for duplicates
+                    existing_topics_imp = read_sql(
+                        "SELECT topic_name FROM topics WHERE user_id=? AND course_id=?",
+                        (user_id, course_id)
+                    )
+                    existing_normalized = set(normalize_text(t) for t in existing_topics_imp["topic_name"].tolist()) if not existing_topics_imp.empty else set()
+
+                    # Mark duplicates
+                    import_df["is_duplicate"] = import_df["topic_name"].apply(
+                        lambda x: normalize_text(x) in existing_normalized
+                    )
+                    import_df.loc[import_df["is_duplicate"], "include"] = False
+
+                    # Select columns for display
+                    display_cols = ["include", "topic_name", "source_file", "frequency", "is_duplicate"]
+                    if "has_subtopics" in import_df.columns:
+                        import_df["subtopics"] = import_df.apply(
+                            lambda row: f"✓ ({row['num_subtopics']})" if row.get("has_subtopics") else "",
+                            axis=1
+                        )
+                        display_cols.insert(4, "subtopics")
+
+                    edited_imports = st.data_editor(
+                        import_df[display_cols],
+                        column_config={
+                            "include": st.column_config.CheckboxColumn("Include", default=True),
+                            "topic_name": st.column_config.TextColumn("Topic Name"),
+                            "source_file": st.column_config.TextColumn("Source File", disabled=True),
+                            "frequency": st.column_config.NumberColumn("Frequency", help="Number of times this topic appears", disabled=True),
+                            "subtopics": st.column_config.TextColumn("Has Subtopics?", disabled=True),
+                            "is_duplicate": st.column_config.CheckboxColumn("Already Exists?", disabled=True)
+                        },
+                        use_container_width=True,
+                        hide_index=True,
+                        key=f"import_topics_editor{form_key_suffix}"
+                    )
+
+                    # Count selections
+                    selected_count = edited_imports["include"].sum()
+                    duplicate_count = edited_imports["is_duplicate"].sum()
+
+                    if duplicate_count > 0:
+                        st.warning(f"{duplicate_count} topic(s) already exist in this course and are unchecked.")
+
+                    st.write(f"**Selected: {selected_count} topic(s)**")
+
+                    st.divider()
+                    st.write("**Step 3: Create Topics**")
+
+                    if st.button(f"Create {selected_count} Topics", type="primary", disabled=selected_count == 0, key=f"create_topics{form_key_suffix}"):
+                        created = 0
+                        skipped = 0
+
+                        # Get existing normalized topics again for final check
+                        existing_topics_imp = read_sql(
+                            "SELECT topic_name FROM topics WHERE user_id=? AND course_id=?",
+                            (user_id, course_id)
+                        )
+                        existing_normalized = set(normalize_text(t) for t in existing_topics_imp["topic_name"].tolist()) if not existing_topics_imp.empty else set()
+
+                        for _, row in edited_imports.iterrows():
+                            if not row["include"]:
+                                continue
+
+                            topic_name_imp = row["topic_name"].strip()
+                            normalized = normalize_text(topic_name_imp)
+
+                            # Skip if already exists
+                            if normalized in existing_normalized:
+                                skipped += 1
+                                continue
+
+                            # Insert topic
+                            execute_returning(
+                                "INSERT INTO topics(user_id, course_id, topic_name, weight_points, notes) VALUES(?,?,?,?,?)",
+                                (user_id, course_id, topic_name_imp, 0, f"Imported from: {row['source_file']}")
+                            )
+                            existing_normalized.add(normalized)
+                            created += 1
+
+                        # Clear session state
+                        st.session_state.imported_topics = None
+                        st.session_state.import_stats = None
+
+                        if created > 0:
+                            st.success(f"Created {created} new topic(s)!")
+                        if skipped > 0:
+                            st.info(f"Skipped {skipped} duplicate(s).")
+
+                        st.rerun()
+                else:
+                    st.info("No topics were extracted. Try uploading different PDF files.")
+
+                # Clear button
+                if st.button("Clear & Start Over", key=f"clear_import{form_key_suffix}"):
+                    st.session_state.imported_topics = None
+                    st.session_state.import_stats = None
+                    st.rerun()
+
+
 # ============ TABS ============
-# Simplified 3-tab layout: Dashboard, Exams (setup), Study (log sessions)
-tabs = st.tabs(["Dashboard", "Exams", "Study"])
+# 4-tab layout: Dashboard, Exams (setup), Topics (management), Study (log sessions)
+tabs = st.tabs(["Dashboard", "Exams", "Topics", "Study"])
 
 # ============ DASHBOARD ============
 with tabs[0]:
@@ -1046,9 +1358,18 @@ with tabs[0]:
                             if st.button("Add", key=key, use_container_width=True):
                                 add_assessment_dialog()
                         elif key == 'checklist_topics':
+                            # Navigate to Topics tab
                             if st.button("Add", key=key, use_container_width=True):
-                                add_topics_dialog()
+                                st.toast("Click the **Topics** tab above to add topics")
             st.markdown("")
+        else:
+            # Setup complete - show compact status with manage topics shortcut
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.success("Setup complete")
+            with col2:
+                if st.button("Manage topics", key="dashboard_manage_topics", use_container_width=True):
+                    st.toast("Click the **Topics** tab above to manage your topics")
 
         # NOTE: Setup bar removed from Dashboard - setup actions only in Exams tab
 
@@ -2032,305 +2353,34 @@ with tabs[1]:
         else:
             st.info("No assessments yet. Add your first one above!")
 
-    # ============ TOPICS EXPANDER ============
-    # Check if we should expand (from checklist navigation)
-    expand_topics = st.session_state.pop("expand_topics", False)
-    with st.expander("Topics", expanded=expand_topics):
-        st.caption("Add topics covered in this course. Weight = expected exam marks for this topic.")
+    # ============ TOPICS LINK ============
+    # Topics management has moved to its own tab for better discoverability
+    st.divider()
+    topics_count = read_sql("SELECT COUNT(*) as cnt FROM topics WHERE user_id=? AND course_id=?", (user_id, course_id))
+    topic_cnt = topics_count.iloc[0]['cnt'] if not topics_count.empty else 0
 
-        topics_df_exp = read_sql("SELECT id, topic_name, weight_points, notes FROM topics WHERE user_id=? AND course_id=? ORDER BY id",
-                             (user_id, course_id))
-
-        with st.form("add_topic_exp"):
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                topic_name_exp = st.text_input("Topic name", placeholder="e.g., Supply and Demand")
-            with col2:
-                weight_exp = st.number_input("Weight (points)", min_value=0, value=10)
-
-            if st.form_submit_button("Add Topic"):
-                if topic_name_exp.strip():
-                    execute_returning("INSERT INTO topics(user_id, course_id, topic_name, weight_points) VALUES(?,?,?,?)",
-                                     (user_id, course_id, topic_name_exp.strip(), weight_exp))
-                    st.success("Topic added!")
-                    st.rerun()
-
-        if not topics_df_exp.empty:
-            st.write("**Existing Topics:**")
-            edited_topics = st.data_editor(
-                topics_df_exp,
-                column_config={
-                    "id": st.column_config.NumberColumn("ID", disabled=True),
-                    "topic_name": st.column_config.TextColumn("Topic Name", width="large"),
-                    "weight_points": st.column_config.NumberColumn("Weight", min_value=0),
-                    "notes": st.column_config.TextColumn("Notes"),
-                },
-                use_container_width=True,
-                hide_index=True,
-                key="topics_editor"
-            )
-
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Save Topic Changes"):
-                    for _, r in edited_topics.iterrows():
-                        if pd.notna(r["id"]):
-                            execute("UPDATE topics SET topic_name=?, weight_points=?, notes=? WHERE id=? AND user_id=?",
-                                   (r["topic_name"], float(r["weight_points"]), r.get("notes"), int(r["id"]), user_id))
-                    st.success("Topics updated!")
-                    st.rerun()
-            with col2:
-                topic_to_delete = st.selectbox("Delete topic", topics_df_exp["topic_name"].tolist(), key="del_topic")
-                if st.button("Delete Selected Topic"):
-                    topic_id_del = topics_df_exp.loc[topics_df_exp["topic_name"] == topic_to_delete, "id"].iloc[0]
-                    execute("DELETE FROM study_sessions WHERE topic_id=?", (int(topic_id_del),))
-                    execute("DELETE FROM exercises WHERE topic_id=?", (int(topic_id_del),))
-                    execute("DELETE FROM topics WHERE id=? AND user_id=?", (int(topic_id_del), user_id))
-                    st.success("Topic and related data deleted!")
-                    st.rerun()
-
-    # ============ IMPORT TOPICS EXPANDER ============
-    with st.expander("Import Topics from PDF", expanded=False):
-        st.caption("Upload lecture slide PDFs to automatically extract topic names.")
-
-        if not HAS_PYMUPDF:
-            st.error("PDF extraction requires PyMuPDF. Install with: `pip install pymupdf`")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        if topic_cnt > 0:
+            st.info(f"**Topics:** {topic_cnt} topic(s) configured. Manage topics in the **Topics** tab.")
         else:
-            # Initialize session state for imported topics
-            if "imported_topics" not in st.session_state:
-                st.session_state.imported_topics = None
-            if "import_stats" not in st.session_state:
-                st.session_state.import_stats = None
+            st.warning("**Topics:** No topics yet. Add topics in the **Topics** tab to track what you need to study.")
+    with col2:
+        if st.button("Go to Topics", key="exams_goto_topics", use_container_width=True):
+            st.toast("Click the **Topics** tab above")
 
-            # File uploader
-            st.write("**Step 1: Upload PDF Files**")
-            uploaded_files = st.file_uploader(
-                "Select lecture slide PDFs",
-                type=["pdf"],
-                accept_multiple_files=True,
-                help="Upload one or more PDF files containing lecture slides"
-            )
+# ============ TOPICS TAB ============
+# Full topics management: add, edit, delete, import from PDF
+with tabs[2]:
+    st.header("Topics")
+    st.write(f"Manage topics for **{selected_course}**")
 
-            if uploaded_files:
-                st.caption(f"{len(uploaded_files)} file(s) selected")
-
-                # SECURITY: File size validation
-                from security import MAX_PDF_SIZE, MAX_TOTAL_UPLOAD_SIZE, validate_pdf_header, sanitize_filename
-                max_file_mb = MAX_PDF_SIZE / (1024 * 1024)
-                max_total_mb = MAX_TOTAL_UPLOAD_SIZE / (1024 * 1024)
-
-                # Check file sizes before processing
-                total_size = 0
-                file_errors = []
-                for f in uploaded_files:
-                    f.seek(0, 2)  # Seek to end
-                    file_size = f.tell()
-                    f.seek(0)  # Reset to start
-                    total_size += file_size
-
-                    if file_size > MAX_PDF_SIZE:
-                        safe_name = sanitize_filename(f.name)
-                        file_errors.append(f"{safe_name}: {file_size / (1024*1024):.1f}MB exceeds {max_file_mb:.0f}MB limit")
-
-                if total_size > MAX_TOTAL_UPLOAD_SIZE:
-                    file_errors.append(f"Total upload size {total_size / (1024*1024):.1f}MB exceeds {max_total_mb:.0f}MB limit")
-
-                if file_errors:
-                    for err in file_errors:
-                        st.error(err)
-                else:
-                    # Extract topics button
-                    if st.button("Extract Topics", type="primary"):
-                        with st.spinner("Extracting topics from PDFs..."):
-                            # Validate PDF headers and read files
-                            pdf_files = []
-                            validation_errors = []
-                            for f in uploaded_files:
-                                content = f.read()
-                                if not validate_pdf_header(content):
-                                    safe_name = sanitize_filename(f.name)
-                                    validation_errors.append(f"{safe_name}: Invalid PDF file")
-                                else:
-                                    pdf_files.append((content, sanitize_filename(f.name)))
-                                f.seek(0)
-
-                            if validation_errors:
-                                for err in validation_errors:
-                                    st.error(err)
-                            elif pdf_files:
-                                try:
-                                    candidates, stats = extract_and_process_topics(pdf_files)
-                                    st.session_state.imported_topics = candidates
-                                    st.session_state.import_stats = stats
-                                    st.success("Extraction complete!")
-                                except Exception as e:
-                                    st.error(f"Error extracting topics: {e}")
-                                    st.session_state.imported_topics = None
-
-            # Show extraction results
-            if st.session_state.imported_topics is not None:
-                stats = st.session_state.import_stats
-
-                st.divider()
-                st.write("**Extraction Summary:**")
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Files Processed", stats["files_processed"])
-                col2.metric("Pages Scanned", stats["total_pages"])
-                col3.metric("Topics Found", stats.get("final_topics", stats.get("final_candidates", 0)))
-                col4.metric("Adaptive Cap", stats.get("adaptive_cap", "N/A"))
-
-                # Detailed extraction pipeline stats
-                with st.expander("Extraction Pipeline Details"):
-                    st.caption("How topics were filtered at each stage:")
-                    st.write(f"1. **Raw candidates extracted:** {stats.get('raw_candidates', stats.get('initial_candidates', 0))}")
-                    st.write(f"2. **After header filter (>10% of pages removed):** {stats.get('after_header_filter', 'N/A')}")
-                    st.write(f"3. **After frequency filter (min 2 or 3% pages):** {stats.get('after_frequency_filter', 'N/A')}")
-                    st.write(f"4. **After similarity clustering (90% threshold):** {stats.get('after_clustering', 'N/A')}")
-                    st.write(f"5. **After hierarchical merge:** {stats.get('after_hierarchical_merge', 'N/A')}")
-                    st.write(f"6. **Final topics (ranked & capped):** {stats.get('final_topics', stats.get('final_candidates', 0))}")
-
-                    reduction_pct = 0
-                    initial = stats.get('raw_candidates', stats.get('initial_candidates', 0))
-                    final = stats.get('final_topics', stats.get('final_candidates', 0))
-                    if initial > 0:
-                        reduction_pct = round((1 - final / initial) * 100, 1)
-                    st.success(f"Reduced by {reduction_pct}% ({initial} → {final} topics)")
-
-                # Show subtopics if available
-                if stats.get("subtopics") and len(stats["subtopics"]) > 0:
-                    show_subtopics = st.checkbox(
-                        f"Show {len(stats['subtopics'])} subtopic(s) that were merged into parent topics",
-                        value=False
-                    )
-                    if show_subtopics:
-                        st.caption("These topics were merged hierarchically (e.g., 'Topic I: Part A' → 'Topic')")
-                        subtopics_df = pd.DataFrame(stats["subtopics"])
-                        st.dataframe(
-                            subtopics_df[["topic_name", "parent_topic"]],
-                            use_container_width=True,
-                            hide_index=True
-                        )
-
-                st.divider()
-                st.write("**Step 2: Review & Edit Topics**")
-                st.caption("Check topics to include, edit names as needed.")
-
-                # Convert to DataFrame for editing
-                if st.session_state.imported_topics:
-                    import_df = pd.DataFrame(st.session_state.imported_topics)
-                    import_df["include"] = True
-
-                    # Handle both old (confidence) and new (occurrence_count) format
-                    if "occurrence_count" in import_df.columns:
-                        import_df["frequency"] = import_df["occurrence_count"]
-                    elif "confidence" in import_df.columns:
-                        import_df["frequency"] = import_df["confidence"].round(2)
-                    else:
-                        import_df["frequency"] = 1
-
-                    # Get existing topics to check for duplicates
-                    existing_topics_imp = read_sql(
-                        "SELECT topic_name FROM topics WHERE user_id=? AND course_id=?",
-                        (user_id, course_id)
-                    )
-                    existing_normalized = set(normalize_text(t) for t in existing_topics_imp["topic_name"].tolist()) if not existing_topics_imp.empty else set()
-
-                    # Mark duplicates
-                    import_df["is_duplicate"] = import_df["topic_name"].apply(
-                        lambda x: normalize_text(x) in existing_normalized
-                    )
-                    import_df.loc[import_df["is_duplicate"], "include"] = False
-
-                    # Select columns for display
-                    display_cols = ["include", "topic_name", "source_file", "frequency", "is_duplicate"]
-                    if "has_subtopics" in import_df.columns:
-                        import_df["subtopics"] = import_df.apply(
-                            lambda row: f"✓ ({row['num_subtopics']})" if row.get("has_subtopics") else "",
-                            axis=1
-                        )
-                        display_cols.insert(4, "subtopics")
-
-                    edited_imports = st.data_editor(
-                        import_df[display_cols],
-                        column_config={
-                            "include": st.column_config.CheckboxColumn("Include", default=True),
-                            "topic_name": st.column_config.TextColumn("Topic Name"),
-                            "source_file": st.column_config.TextColumn("Source File", disabled=True),
-                            "frequency": st.column_config.NumberColumn("Frequency", help="Number of times this topic appears", disabled=True),
-                            "subtopics": st.column_config.TextColumn("Has Subtopics?", disabled=True),
-                            "is_duplicate": st.column_config.CheckboxColumn("Already Exists?", disabled=True)
-                        },
-                        use_container_width=True,
-                        hide_index=True,
-                        key="import_topics_editor"
-                    )
-
-                    # Count selections
-                    selected_count = edited_imports["include"].sum()
-                    duplicate_count = edited_imports["is_duplicate"].sum()
-
-                    if duplicate_count > 0:
-                        st.warning(f"{duplicate_count} topic(s) already exist in this course and are unchecked.")
-
-                    st.write(f"**Selected: {selected_count} topic(s)**")
-
-                    st.divider()
-                    st.write("**Step 3: Create Topics**")
-
-                    if st.button(f"Create {selected_count} Topics", type="primary", disabled=selected_count == 0):
-                        created = 0
-                        skipped = 0
-
-                        # Get existing normalized topics again for final check
-                        existing_topics_imp = read_sql(
-                            "SELECT topic_name FROM topics WHERE user_id=? AND course_id=?",
-                            (user_id, course_id)
-                        )
-                        existing_normalized = set(normalize_text(t) for t in existing_topics_imp["topic_name"].tolist()) if not existing_topics_imp.empty else set()
-
-                        for _, row in edited_imports.iterrows():
-                            if not row["include"]:
-                                continue
-
-                            topic_name_imp = row["topic_name"].strip()
-                            normalized = normalize_text(topic_name_imp)
-
-                            # Skip if already exists
-                            if normalized in existing_normalized:
-                                skipped += 1
-                                continue
-
-                            # Insert topic
-                            execute_returning(
-                                "INSERT INTO topics(user_id, course_id, topic_name, weight_points, notes) VALUES(?,?,?,?,?)",
-                                (user_id, course_id, topic_name_imp, 0, f"Imported from: {row['source_file']}")
-                            )
-                            existing_normalized.add(normalized)
-                            created += 1
-
-                        # Clear session state
-                        st.session_state.imported_topics = None
-                        st.session_state.import_stats = None
-
-                        if created > 0:
-                            st.success(f"Created {created} new topic(s)!")
-                        if skipped > 0:
-                            st.info(f"Skipped {skipped} duplicate(s).")
-
-                        st.info("Expand Topics above to set weight points for your new topics.")
-                        st.rerun()
-                else:
-                    st.info("No topics were extracted. Try uploading different PDF files.")
-
-                # Clear button
-                if st.button("Clear & Start Over"):
-                    st.session_state.imported_topics = None
-                    st.session_state.import_stats = None
-                    st.rerun()
+    # Render the full topics manager
+    render_topics_manager(user_id, course_id, show_import=True, form_key_suffix="_topics_tab")
 
 # ============ STUDY TAB ============
 # Contains: Study Sessions, Exercises, Timed Attempts, Lecture Calendar, Export
-with tabs[2]:
+with tabs[3]:
     st.header("Study & Practice")
     st.caption("Log study sessions, exercises, timed attempts, and manage lectures.")
 
