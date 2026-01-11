@@ -356,8 +356,14 @@ def column_exists(table: str, column: str) -> bool:
         )
         return row[0] if row else False
     else:
+        from security import validate_table_name
+        # Validate table name to prevent SQL injection in PRAGMA
+        try:
+            validated_table = validate_table_name(table)
+        except ValueError:
+            return False
         with get_conn() as conn:
-            cur = conn.execute(f"PRAGMA table_info({table})")
+            cur = conn.execute(f"PRAGMA table_info({validated_table})")
             columns = [r[1] for r in cur.fetchall()]
             return column in columns
 
@@ -977,84 +983,113 @@ def get_admin_stats() -> dict:
 
 def has_legacy_data() -> bool:
     """Check if there is any data with NULL user_id (legacy data)."""
+    from security import validate_table_name
     tables_to_check = ["courses", "topics", "exams", "scheduled_lectures", "timed_attempts", "assessments"]
     for table in tables_to_check:
-        if table_exists(table) and column_exists(table, "user_id"):
-            row = fetchone(f"SELECT COUNT(*) FROM {table} WHERE user_id IS NULL")
+        # Validate table name against allowlist before using in query
+        try:
+            validated_table = validate_table_name(table)
+        except ValueError:
+            continue  # Skip invalid table names
+        if table_exists(validated_table) and column_exists(validated_table, "user_id"):
+            row = fetchone(f"SELECT COUNT(*) FROM {validated_table} WHERE user_id IS NULL")
             if row and row[0] > 0:
                 return True
     return False
 
 def get_legacy_data_counts() -> dict:
     """Get counts of legacy data (NULL user_id) per table."""
+    from security import validate_table_name
     counts = {}
     tables_to_check = ["courses", "topics", "exams", "scheduled_lectures", "timed_attempts", "assessments"]
     for table in tables_to_check:
-        if table_exists(table) and column_exists(table, "user_id"):
-            row = fetchone(f"SELECT COUNT(*) FROM {table} WHERE user_id IS NULL")
-            counts[table] = row[0] if row else 0
+        # Validate table name against allowlist before using in query
+        try:
+            validated_table = validate_table_name(table)
+        except ValueError:
+            continue  # Skip invalid table names
+        if table_exists(validated_table) and column_exists(validated_table, "user_id"):
+            row = fetchone(f"SELECT COUNT(*) FROM {validated_table} WHERE user_id IS NULL")
+            counts[validated_table] = row[0] if row else 0
     return counts
 
 def claim_legacy_data(user_id: int) -> dict:
     """
     Assign all legacy data (NULL user_id) to the specified user.
     Returns counts of claimed rows per table.
+
+    SECURITY: This function is disabled for safety. Legacy data migration
+    should be done via admin scripts, not user-triggered actions.
+    """
+    # SECURITY: Disable legacy data claiming to prevent data theft
+    # If you need to migrate legacy data, use a controlled admin script
+    # that verifies ownership through other means (e.g., email verification)
+    return {"error": "Legacy data claiming is disabled for security reasons"}
+
+
+def _admin_claim_legacy_data(user_id: int) -> dict:
+    """
+    ADMIN ONLY: Assign all legacy data (NULL user_id) to the specified user.
+    This function should only be called from admin scripts, never from user actions.
+
+    Returns counts of claimed rows per table.
     """
     claimed = {}
-    
-    # First claim courses
+
+    # First claim courses - only those with NULL user_id
     if table_exists("courses") and column_exists("courses", "user_id"):
         execute("UPDATE courses SET user_id=? WHERE user_id IS NULL", (user_id,))
         row = fetchone("SELECT changes()")  # SQLite specific
         claimed["courses"] = row[0] if row else 0
-    
+
     # Get claimed course IDs to update related tables
     course_rows = fetchall("SELECT id FROM courses WHERE user_id=?", (user_id,))
     course_ids = [r[0] for r in course_rows] if course_rows else []
-    
+
+    if not course_ids:
+        return claimed
+
+    # Build parameterized IN clause safely
+    placeholders = ",".join("?" * len(course_ids))
+
     # Claim topics for these courses
-    if table_exists("topics") and column_exists("topics", "user_id") and course_ids:
-        placeholders = ",".join("?" * len(course_ids))
-        execute(f"UPDATE topics SET user_id=? WHERE user_id IS NULL AND course_id IN ({placeholders})", 
+    if table_exists("topics") and column_exists("topics", "user_id"):
+        execute(f"UPDATE topics SET user_id=? WHERE user_id IS NULL AND course_id IN ({placeholders})",
                 (user_id, *course_ids))
-        claimed["topics"] = len(fetchall(f"SELECT id FROM topics WHERE user_id=? AND course_id IN ({placeholders})", 
-                                         (user_id, *course_ids))) if course_ids else 0
-    
+        claimed["topics"] = len(fetchall(f"SELECT id FROM topics WHERE user_id=? AND course_id IN ({placeholders})",
+                                         (user_id, *course_ids)))
+
     # Claim exams
-    if table_exists("exams") and column_exists("exams", "user_id") and course_ids:
-        placeholders = ",".join("?" * len(course_ids))
-        execute(f"UPDATE exams SET user_id=? WHERE user_id IS NULL AND course_id IN ({placeholders})", 
+    if table_exists("exams") and column_exists("exams", "user_id"):
+        execute(f"UPDATE exams SET user_id=? WHERE user_id IS NULL AND course_id IN ({placeholders})",
                 (user_id, *course_ids))
-        claimed["exams"] = len(fetchall(f"SELECT id FROM exams WHERE user_id=? AND course_id IN ({placeholders})", 
-                                        (user_id, *course_ids))) if course_ids else 0
-    
+        claimed["exams"] = len(fetchall(f"SELECT id FROM exams WHERE user_id=? AND course_id IN ({placeholders})",
+                                        (user_id, *course_ids)))
+
     # Claim scheduled_lectures
-    if table_exists("scheduled_lectures") and column_exists("scheduled_lectures", "user_id") and course_ids:
-        placeholders = ",".join("?" * len(course_ids))
-        execute(f"UPDATE scheduled_lectures SET user_id=? WHERE user_id IS NULL AND course_id IN ({placeholders})", 
+    if table_exists("scheduled_lectures") and column_exists("scheduled_lectures", "user_id"):
+        execute(f"UPDATE scheduled_lectures SET user_id=? WHERE user_id IS NULL AND course_id IN ({placeholders})",
                 (user_id, *course_ids))
         claimed["scheduled_lectures"] = len(fetchall(
-            f"SELECT id FROM scheduled_lectures WHERE user_id=? AND course_id IN ({placeholders})", 
-            (user_id, *course_ids))) if course_ids else 0
-    
+            f"SELECT id FROM scheduled_lectures WHERE user_id=? AND course_id IN ({placeholders})",
+            (user_id, *course_ids)))
+
     # Claim timed_attempts
-    if table_exists("timed_attempts") and column_exists("timed_attempts", "user_id") and course_ids:
-        placeholders = ",".join("?" * len(course_ids))
-        execute(f"UPDATE timed_attempts SET user_id=? WHERE user_id IS NULL AND course_id IN ({placeholders})", 
+    if table_exists("timed_attempts") and column_exists("timed_attempts", "user_id"):
+        execute(f"UPDATE timed_attempts SET user_id=? WHERE user_id IS NULL AND course_id IN ({placeholders})",
                 (user_id, *course_ids))
         claimed["timed_attempts"] = len(fetchall(
-            f"SELECT id FROM timed_attempts WHERE user_id=? AND course_id IN ({placeholders})", 
-            (user_id, *course_ids))) if course_ids else 0
-    
+            f"SELECT id FROM timed_attempts WHERE user_id=? AND course_id IN ({placeholders})",
+            (user_id, *course_ids)))
+
     # Claim assessments
-    if table_exists("assessments") and column_exists("assessments", "user_id") and course_ids:
-        placeholders = ",".join("?" * len(course_ids))
-        execute(f"UPDATE assessments SET user_id=? WHERE user_id IS NULL AND course_id IN ({placeholders})", 
+    if table_exists("assessments") and column_exists("assessments", "user_id"):
+        execute(f"UPDATE assessments SET user_id=? WHERE user_id IS NULL AND course_id IN ({placeholders})",
                 (user_id, *course_ids))
         claimed["assessments"] = len(fetchall(
-            f"SELECT id FROM assessments WHERE user_id=? AND course_id IN ({placeholders})", 
-            (user_id, *course_ids))) if course_ids else 0
-    
+            f"SELECT id FROM assessments WHERE user_id=? AND course_id IN ({placeholders})",
+            (user_id, *course_ids)))
+
     return claimed
 
 def get_or_create_course(user_id: int, course_name: str) -> int:

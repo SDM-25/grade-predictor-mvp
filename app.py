@@ -160,8 +160,10 @@ if "user_id" not in st.session_state:
     st.session_state.is_admin = False
 
 # Session ID for tracking (generated once per browser session)
+# SECURITY: Use cryptographically secure token instead of UUID
 if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
+    from security import generate_secure_token
+    st.session_state.session_id = generate_secure_token(24)
 
 # Wizard state
 if "wizard_step" not in st.session_state:
@@ -231,40 +233,47 @@ def show_auth_page():
                 if not login_email or not login_password:
                     st.error("Please enter email and password.")
                 else:
-                    user = get_user_by_email(login_email)
-                    if user is None:
-                        st.error("Email not found. Please sign up first.")
-                    elif not user["password_hash"]:
-                        st.error("This account has no password set. Please contact support.")
-                    elif not verify_password(login_password, user["password_hash"]):
-                        st.error("Incorrect password.")
+                    # SECURITY: Rate limit login attempts (5 attempts per minute per email)
+                    from security import check_rate_limit, get_rate_limit_retry_after, sanitize_string
+                    rate_key = f"login:{sanitize_string(login_email.lower(), max_length=255)}"
+                    if not check_rate_limit(rate_key, max_requests=5, window_seconds=60):
+                        retry_after = get_rate_limit_retry_after(rate_key, window_seconds=60)
+                        st.error(f"Too many login attempts. Please wait {retry_after} seconds.")
                     else:
-                        # Successful login
-                        st.session_state.user_id = user["id"]
-                        st.session_state.user_email = user["email"]
-                        update_last_login(user["id"])
-                        st.session_state.wizard_step = 0
-                        st.session_state.wizard_data = {}
+                        user = get_user_by_email(login_email)
+                        if user is None:
+                            st.error("Email not found. Please sign up first.")
+                        elif not user["password_hash"]:
+                            st.error("This account has no password set. Please contact support.")
+                        elif not verify_password(login_password, user["password_hash"]):
+                            st.error("Incorrect password.")
+                        else:
+                            # Successful login
+                            st.session_state.user_id = user["id"]
+                            st.session_state.user_email = user["email"]
+                            update_last_login(user["id"])
+                            st.session_state.wizard_step = 0
+                            st.session_state.wizard_data = {}
 
-                        # Handle "Remember me" - create persistent token
-                        if remember_me and HAS_COOKIE_MANAGER:
-                            # Generate token valid for 30 days
-                            raw_token = generate_token()
-                            expires_at = datetime.now() + timedelta(days=30)
+                            # Handle "Remember me" - create persistent token
+                            if remember_me and HAS_COOKIE_MANAGER:
+                                # Generate token valid for 30 days
+                                raw_token = generate_token()
+                                expires_at = datetime.now() + timedelta(days=30)
 
-                            # Store hashed token in database
-                            store_token(user["id"], raw_token, expires_at)
+                                # Store hashed token in database
+                                store_token(user["id"], raw_token, expires_at)
 
-                            # Store raw token in cookie
-                            cookie_manager.set(
-                                "auth_token",
-                                raw_token,
-                                expires_at=expires_at,
-                                key="auth_token_cookie"
-                            )
+                                # Store raw token in cookie
+                                cookie_manager.set(
+                                    "auth_token",
+                                    raw_token,
+                                    expires_at=expires_at,
+                                    key="auth_token_cookie"
+                                )
 
-                        st.success("Login successful!")
-                        st.rerun()
+                            st.success("Login successful!")
+                            st.rerun()
 
         # Safe debug info
         if HAS_COOKIE_MANAGER:
@@ -306,43 +315,50 @@ def show_auth_page():
             signup_password_confirm = st.text_input("Confirm Password *", type="password", key="signup_password_confirm_input")
             
             submitted = st.form_submit_button("Create Account", type="primary", use_container_width=True)
-            
+
             if submitted:
-                errors = []
-                
-                # Email validation
-                if not signup_email:
-                    errors.append("Email is required.")
-                elif not re.match(r"[^@]+@[^@]+\.[^@]+", signup_email):
-                    errors.append("Invalid email format.")
-                
-                # Password validation
-                if not signup_password:
-                    errors.append("Password is required.")
-                elif len(signup_password) < 8:
-                    errors.append("Password must be at least 8 characters.")
-                
-                if signup_password != signup_password_confirm:
-                    errors.append("Passwords do not match.")
-                
-                if errors:
-                    for e in errors:
-                        st.error(e)
+                # SECURITY: Rate limit signup attempts (3 signups per 5 minutes per session)
+                from security import check_rate_limit, get_rate_limit_retry_after
+                rate_key = f"signup:{st.session_state.get('session_id', 'anonymous')}"
+                if not check_rate_limit(rate_key, max_requests=3, window_seconds=300):
+                    retry_after = get_rate_limit_retry_after(rate_key, window_seconds=300)
+                    st.error(f"Too many signup attempts. Please wait {retry_after} seconds.")
                 else:
-                    try:
-                        user_id = create_user(
-                            signup_email, 
-                            signup_username if signup_username else None, 
-                            signup_password
-                        )
-                        st.session_state.user_id = user_id
-                        st.session_state.user_email = signup_email.lower().strip()
-                        update_last_login(user_id)
-                        st.session_state.wizard_step = 0
-                        st.success("Account created! Welcome!")
-                        st.rerun()
-                    except ValueError as e:
-                        st.error(str(e))
+                    errors = []
+
+                    # Email validation
+                    if not signup_email:
+                        errors.append("Email is required.")
+                    elif not re.match(r"[^@]+@[^@]+\.[^@]+", signup_email):
+                        errors.append("Invalid email format.")
+
+                    # Password validation
+                    if not signup_password:
+                        errors.append("Password is required.")
+                    elif len(signup_password) < 8:
+                        errors.append("Password must be at least 8 characters.")
+
+                    if signup_password != signup_password_confirm:
+                        errors.append("Passwords do not match.")
+
+                    if errors:
+                        for e in errors:
+                            st.error(e)
+                    else:
+                        try:
+                            user_id = create_user(
+                                signup_email,
+                                signup_username if signup_username else None,
+                                signup_password
+                            )
+                            st.session_state.user_id = user_id
+                            st.session_state.user_email = signup_email.lower().strip()
+                            update_last_login(user_id)
+                            st.session_state.wizard_step = 0
+                            st.success("Account created! Welcome!")
+                            st.rerun()
+                        except ValueError as e:
+                            st.error(str(e))
     
     # Admin tab
     with admin_tab:
@@ -379,25 +395,32 @@ def show_auth_page():
                 if not admin_username or not admin_password:
                     st.error("Please enter admin credentials.")
                 else:
-                    # Check if secrets are configured before attempting login
-                    try:
-                        has_username = "ADMIN_USERNAME" in st.secrets
-                        has_password_hash = "ADMIN_PASSWORD_HASH" in st.secrets
-                        has_password_plain = "ADMIN_PASSWORD" in st.secrets
+                    # SECURITY: Strict rate limit for admin login (3 attempts per 5 minutes)
+                    from security import check_rate_limit, get_rate_limit_retry_after
+                    rate_key = f"admin_login:{st.session_state.get('session_id', 'anonymous')}"
+                    if not check_rate_limit(rate_key, max_requests=3, window_seconds=300):
+                        retry_after = get_rate_limit_retry_after(rate_key, window_seconds=300)
+                        st.error(f"Too many admin login attempts. Please wait {retry_after} seconds.")
+                    else:
+                        # Check if secrets are configured before attempting login
+                        try:
+                            has_username = "ADMIN_USERNAME" in st.secrets
+                            has_password_hash = "ADMIN_PASSWORD_HASH" in st.secrets
+                            has_password_plain = "ADMIN_PASSWORD" in st.secrets
 
-                        if not has_username or (not has_password_hash and not has_password_plain):
-                            st.error("❌ Admin secrets not configured. Please set ADMIN_USERNAME and either ADMIN_PASSWORD_HASH or ADMIN_PASSWORD in Streamlit Cloud secrets.")
-                        elif verify_admin(admin_username, admin_password):
-                            st.session_state.user_id = -1  # Special admin ID
-                            st.session_state.user_email = admin_username
-                            st.session_state.is_admin = True
-                            log_event(None, "admin_login", f'{{"username": "{admin_username}"}}')
-                            st.success("Admin login successful!")
-                            st.rerun()
-                        else:
-                            st.error("Invalid admin credentials.")
-                    except Exception as e:
-                        st.error(f"❌ Error during admin login: {str(e)}")
+                            if not has_username or (not has_password_hash and not has_password_plain):
+                                st.error("Admin secrets not configured. Please set ADMIN_USERNAME and either ADMIN_PASSWORD_HASH or ADMIN_PASSWORD in Streamlit Cloud secrets.")
+                            elif verify_admin(admin_username, admin_password):
+                                st.session_state.user_id = -1  # Special admin ID
+                                st.session_state.user_email = admin_username
+                                st.session_state.is_admin = True
+                                log_event(None, "admin_login", f'{{"username": "{admin_username}"}}')
+                                st.success("Admin login successful!")
+                                st.rerun()
+                            else:
+                                st.error("Invalid admin credentials.")
+                        except Exception as e:
+                            st.error(f"Error during admin login: {str(e)}")
     
     st.divider()
     if DEV_MODE:
@@ -425,7 +448,8 @@ if st.session_state.is_admin:
         st.session_state.user_id = None
         st.session_state.user_email = None
         st.session_state.is_admin = False
-        st.session_state.session_id = str(uuid.uuid4())
+        from security import generate_secure_token
+        st.session_state.session_id = generate_secure_token(24)
         log_event(None, "admin_logout")
         st.rerun()
     
@@ -687,8 +711,9 @@ with st.sidebar:
         st.session_state.wizard_step = 0
         st.session_state.wizard_data = {}
         st.session_state.legacy_checked = False
-        # Generate new session_id for next login
-        st.session_state.session_id = str(uuid.uuid4())
+        # Generate new secure session_id for next login
+        from security import generate_secure_token
+        st.session_state.session_id = generate_secure_token(24)
         st.rerun()
     if DEV_MODE:
         st.caption(f"Database: {db_mode}")
@@ -2089,22 +2114,58 @@ with tabs[1]:
             if uploaded_files:
                 st.caption(f"{len(uploaded_files)} file(s) selected")
 
-                # Extract topics button
-                if st.button("Extract Topics", type="primary"):
-                    with st.spinner("Extracting topics from PDFs..."):
-                        pdf_files = [(f.read(), f.name) for f in uploaded_files]
-                        # Reset file pointers
-                        for f in uploaded_files:
-                            f.seek(0)
+                # SECURITY: File size validation
+                from security import MAX_PDF_SIZE, MAX_TOTAL_UPLOAD_SIZE, validate_pdf_header, sanitize_filename
+                max_file_mb = MAX_PDF_SIZE / (1024 * 1024)
+                max_total_mb = MAX_TOTAL_UPLOAD_SIZE / (1024 * 1024)
 
-                        try:
-                            candidates, stats = extract_and_process_topics(pdf_files)
-                            st.session_state.imported_topics = candidates
-                            st.session_state.import_stats = stats
-                            st.success("Extraction complete!")
-                        except Exception as e:
-                            st.error(f"Error extracting topics: {e}")
-                            st.session_state.imported_topics = None
+                # Check file sizes before processing
+                total_size = 0
+                file_errors = []
+                for f in uploaded_files:
+                    f.seek(0, 2)  # Seek to end
+                    file_size = f.tell()
+                    f.seek(0)  # Reset to start
+                    total_size += file_size
+
+                    if file_size > MAX_PDF_SIZE:
+                        safe_name = sanitize_filename(f.name)
+                        file_errors.append(f"{safe_name}: {file_size / (1024*1024):.1f}MB exceeds {max_file_mb:.0f}MB limit")
+
+                if total_size > MAX_TOTAL_UPLOAD_SIZE:
+                    file_errors.append(f"Total upload size {total_size / (1024*1024):.1f}MB exceeds {max_total_mb:.0f}MB limit")
+
+                if file_errors:
+                    for err in file_errors:
+                        st.error(err)
+                else:
+                    # Extract topics button
+                    if st.button("Extract Topics", type="primary"):
+                        with st.spinner("Extracting topics from PDFs..."):
+                            # Validate PDF headers and read files
+                            pdf_files = []
+                            validation_errors = []
+                            for f in uploaded_files:
+                                content = f.read()
+                                if not validate_pdf_header(content):
+                                    safe_name = sanitize_filename(f.name)
+                                    validation_errors.append(f"{safe_name}: Invalid PDF file")
+                                else:
+                                    pdf_files.append((content, sanitize_filename(f.name)))
+                                f.seek(0)
+
+                            if validation_errors:
+                                for err in validation_errors:
+                                    st.error(err)
+                            elif pdf_files:
+                                try:
+                                    candidates, stats = extract_and_process_topics(pdf_files)
+                                    st.session_state.imported_topics = candidates
+                                    st.session_state.import_stats = stats
+                                    st.success("Extraction complete!")
+                                except Exception as e:
+                                    st.error(f"Error extracting topics: {e}")
+                                    st.session_state.imported_topics = None
 
             # Show extraction results
             if st.session_state.imported_topics is not None:
