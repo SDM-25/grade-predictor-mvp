@@ -22,6 +22,8 @@ from .runner import (
     get_applied_migrations,
     get_pending_migrations,
     validate_schema,
+    repair_schema,
     SchemaError,
+    MigrationError,
     EXPECTED_SCHEMA,
 )

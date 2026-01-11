@@ -523,6 +523,117 @@ def _column_exists(table: str, column: str) -> bool:
     return db.column_exists(table, column)
 
 
+def _add_column_if_missing(table: str, column: str, column_def: str) -> bool:
+    """
+    Add a column to a table if it doesn't exist (SQLite-safe).
+    Returns True if column was added, False if it already existed.
+    """
+    if _column_exists(table, column):
+        return False
+
+    if not _table_exists(table):
+        return False
+
+    with _get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            if _is_postgres():
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")
+            else:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")
+            conn.commit()
+            return True
+        except Exception as e:
+            # Column might already exist (race condition) or other error
+            conn.rollback()
+            return False
+
+
+def repair_schema(verbose: bool = False) -> Dict[str, List[str]]:
+    """
+    Attempt to repair schema by adding missing columns.
+    This is a safety net for when migrations didn't properly add columns.
+
+    Returns dict of {table: [columns_added]}
+    """
+    # Column definitions for repair (column_name: sql_type_with_default)
+    COLUMN_DEFS = {
+        "users": {
+            "username": "TEXT UNIQUE",
+            "password_hash": "TEXT NOT NULL DEFAULT ''",
+            "last_login_at": "TIMESTAMP",
+        },
+        "courses": {
+            "user_id": "INTEGER",
+            "total_marks": "INTEGER NOT NULL DEFAULT 120",
+            "target_marks": "INTEGER NOT NULL DEFAULT 90",
+        },
+        "exams": {
+            "user_id": "INTEGER",
+            "actual_marks": "INTEGER DEFAULT NULL",
+            "is_retake": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "topics": {
+            "user_id": "INTEGER",
+            "notes": "TEXT",
+        },
+        "study_sessions": {
+            "notes": "TEXT",
+        },
+        "exercises": {
+            "source": "TEXT",
+            "notes": "TEXT",
+        },
+        "scheduled_lectures": {
+            "user_id": "INTEGER",
+            "notes": "TEXT",
+        },
+        "timed_attempts": {
+            "user_id": "INTEGER",
+            "notes": "TEXT",
+        },
+        "assessments": {
+            "user_id": "INTEGER",
+            "actual_marks": "INTEGER DEFAULT NULL",
+            "progress_pct": "INTEGER DEFAULT 0",
+            "notes": "TEXT",
+        },
+        "assignment_work": {
+            "description": "TEXT",
+        },
+        "sessions": {},
+        "events": {
+            "metadata": "TEXT",
+        },
+        "auth_tokens": {
+            "user_agent": "TEXT",
+            "revoked_at": "TIMESTAMP",
+        },
+    }
+
+    repaired: Dict[str, List[str]] = {}
+
+    for table, expected_columns in EXPECTED_SCHEMA.items():
+        if not _table_exists(table):
+            continue
+
+        added = []
+        for col in expected_columns:
+            if not _column_exists(table, col):
+                # Get column definition
+                col_def = COLUMN_DEFS.get(table, {}).get(col)
+                if col_def:
+                    if verbose:
+                        print(f"[migrations] Repairing: Adding {table}.{col}")
+                    if _add_column_if_missing(table, col, col_def):
+                        added.append(col)
+
+        if added:
+            repaired[table] = added
+
+    return repaired
+
+
 def _ensure_migrations_table():
     """Create _migrations table if it doesn't exist."""
     with _get_db_connection() as conn:
@@ -578,9 +689,14 @@ def _mark_migration_applied(name: str, conn):
         )
 
 
-def run_migrations(verbose: bool = True) -> List[str]:
+def run_migrations(verbose: bool = True, auto_repair: bool = True) -> List[str]:
     """
     Apply all pending migrations in order.
+
+    Args:
+        verbose: Print progress messages
+        auto_repair: If True, attempt to add missing columns after migrations
+
     Returns list of applied migration names.
     """
     _ensure_migrations_table()
@@ -600,6 +716,9 @@ def run_migrations(verbose: bool = True) -> List[str]:
                 for stmt in sql.strip().split(';'):
                     stmt = stmt.strip()
                     if stmt and not stmt.startswith('--'):
+                        # Skip placeholder statements
+                        if stmt.upper() == 'SELECT 1':
+                            continue
                         cur.execute(stmt)
 
                 _mark_migration_applied(name, conn)
@@ -614,10 +733,18 @@ def run_migrations(verbose: bool = True) -> List[str]:
     elif verbose:
         print("[migrations] Schema up to date")
 
+    # Auto-repair: Add any missing columns that migrations didn't create
+    # This handles SQLite migrations that were placeholder SELECT 1 statements
+    if auto_repair:
+        repaired = repair_schema(verbose=verbose)
+        if repaired and verbose:
+            total_cols = sum(len(cols) for cols in repaired.values())
+            print(f"[migrations] Auto-repaired {total_cols} missing column(s)")
+
     return applied
 
 
-def validate_schema(raise_on_error: bool = True) -> Dict[str, List[str]]:
+def validate_schema(raise_on_error: bool = True, auto_repair: bool = True) -> Dict[str, List[str]]:
     """
     Validate that all expected tables and columns exist.
 
@@ -626,22 +753,18 @@ def validate_schema(raise_on_error: bool = True) -> Dict[str, List[str]]:
 
     Args:
         raise_on_error: If True, raises SchemaError on first missing item
+        auto_repair: If True, attempt to repair before raising error
 
     Returns:
         Dict of {table: [missing_columns]} (empty if valid)
 
     Raises:
-        SchemaError: If raise_on_error=True and schema is invalid
+        SchemaError: If raise_on_error=True and schema is invalid after repair
     """
     issues: Dict[str, List[str]] = {}
 
     for table, expected_columns in EXPECTED_SCHEMA.items():
         if not _table_exists(table):
-            if raise_on_error:
-                raise SchemaError(
-                    f"Missing table: {table}. "
-                    f"Run migrations with: python -c 'from migrations import run_migrations; run_migrations()'"
-                )
             issues[table] = ["TABLE_MISSING"]
             continue
 
@@ -651,12 +774,45 @@ def validate_schema(raise_on_error: bool = True) -> Dict[str, List[str]]:
                 missing.append(col)
 
         if missing:
-            if raise_on_error:
-                raise SchemaError(
-                    f"Table '{table}' is missing columns: {missing}. "
-                    f"Run migrations to fix."
-                )
             issues[table] = missing
+
+    # If there are issues and auto_repair is enabled, try to fix them
+    if issues and auto_repair:
+        repaired = repair_schema(verbose=True)
+
+        # Re-check after repair
+        issues_after = {}
+        for table, expected_columns in EXPECTED_SCHEMA.items():
+            if not _table_exists(table):
+                issues_after[table] = ["TABLE_MISSING"]
+                continue
+
+            missing = []
+            for col in expected_columns:
+                if not _column_exists(table, col):
+                    missing.append(col)
+
+            if missing:
+                issues_after[table] = missing
+
+        issues = issues_after
+
+    # Raise error if still have issues
+    if issues and raise_on_error:
+        # Build helpful error message
+        error_parts = ["Schema validation failed after auto-repair attempt:"]
+        for table, cols in issues.items():
+            if cols == ["TABLE_MISSING"]:
+                error_parts.append(f"  - Missing table: {table}")
+            else:
+                error_parts.append(f"  - Table '{table}' missing columns: {cols}")
+
+        error_parts.append("")
+        error_parts.append("To fix manually:")
+        error_parts.append("  1. Delete the database file and restart (loses all data)")
+        error_parts.append("  2. Or run: python -c 'from migrations.runner import repair_schema; repair_schema(verbose=True)'")
+
+        raise SchemaError("\n".join(error_parts))
 
     return issues
 

@@ -374,8 +374,9 @@ def init_db(validate: bool = True, verbose: bool = False):
     Initialize database schema using migrations system.
 
     This function:
-    1. Runs all pending migrations in order
+    1. Runs all pending migrations in order (with auto-repair for SQLite)
     2. Validates schema matches expected structure (prevents missing column bugs)
+    3. Auto-repairs missing columns before failing
 
     Args:
         validate: If True (default), validate schema after migrations.
@@ -383,7 +384,7 @@ def init_db(validate: bool = True, verbose: bool = False):
         verbose: If True, print migration progress.
 
     Raises:
-        SchemaError: If validate=True and schema is invalid after migrations.
+        SchemaError: If validate=True and schema is invalid after repair attempts.
 
     Usage:
         # Standard initialization (recommended)
@@ -395,26 +396,33 @@ def init_db(validate: bool = True, verbose: bool = False):
         # Verbose mode for debugging
         init_db(verbose=True)
     """
-    from migrations import run_migrations, validate_schema, SchemaError
+    from migrations import run_migrations, validate_schema, repair_schema, SchemaError
 
-    # Run all pending migrations
-    applied = run_migrations(verbose=verbose)
+    try:
+        # Run all pending migrations (includes auto-repair)
+        applied = run_migrations(verbose=verbose, auto_repair=True)
 
-    # Validate schema to catch missing columns BEFORE app runs
-    if validate:
-        try:
-            validate_schema(raise_on_error=True)
-        except SchemaError as e:
-            # Re-raise with helpful message
-            raise SchemaError(
-                f"Schema validation failed: {e}\n"
-                f"Database: {get_database_url()}\n"
-                f"This is a FATAL error - the app cannot run with missing schema elements.\n"
-                f"Check migrations or database state."
-            ) from e
+        # Validate schema to catch missing columns BEFORE app runs
+        # validate_schema also attempts auto-repair before failing
+        if validate:
+            validate_schema(raise_on_error=True, auto_repair=True)
 
-    if verbose:
-        print(f"[db] Initialized. Using: {get_database_url()}")
+        if verbose:
+            print(f"[db] Initialized. Using: {get_database_url()}")
+
+    except SchemaError as e:
+        # Log the full error for debugging
+        import sys
+        print(f"[db] FATAL: Schema error during init_db()", file=sys.stderr)
+        print(f"[db] Database: {get_database_url()}", file=sys.stderr)
+        print(f"[db] Error: {e}", file=sys.stderr)
+        raise  # Re-raise the original error with its helpful message
+
+    except Exception as e:
+        # Unexpected error - wrap with context
+        import sys
+        print(f"[db] FATAL: Unexpected error during init_db(): {e}", file=sys.stderr)
+        raise
 
 
 def init_db_legacy():
