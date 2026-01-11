@@ -917,6 +917,30 @@ def add_assessment_dialog():
             else:
                 st.error("Please enter an assessment name.")
 
+@st.dialog("Add Topic")
+def add_topics_dialog():
+    """Dialog for adding a new topic."""
+    topic_name = st.text_input("Topic name *", placeholder="e.g., Supply and Demand")
+    weight = st.number_input("Weight (points)", min_value=0, value=10,
+                             help="Expected exam marks for this topic")
+    notes = st.text_input("Notes (optional)")
+
+    col_cancel, col_submit = st.columns(2)
+    with col_cancel:
+        if st.button("Cancel", use_container_width=True, key="topic_cancel"):
+            st.rerun()
+    with col_submit:
+        if st.button("Add Topic", type="primary", use_container_width=True, key="topic_submit"):
+            if topic_name.strip():
+                execute_returning(
+                    "INSERT INTO topics(user_id, course_id, topic_name, weight_points, notes) VALUES(?,?,?,?,?)",
+                    (user_id, course_id, topic_name.strip(), weight, notes if notes else None)
+                )
+                st.toast(f"Added topic: {topic_name}")
+                st.rerun()
+            else:
+                st.error("Please enter a topic name.")
+
 # ============ SETUP BAR HELPER ============
 def render_setup_bar(user_id: int, course_id: int):
     """Render a persistent setup bar with primary actions."""
@@ -998,9 +1022,7 @@ with tabs[0]:
                                 add_assessment_dialog()
                         elif key == 'checklist_topics':
                             if st.button("Add", key=key, use_container_width=True):
-                                st.session_state.expand_topics = True
-                                st.session_state.navigate_to_exams_tab = True
-                                st.rerun()
+                                add_topics_dialog()
             st.markdown("")
 
         # NOTE: Setup bar removed from Dashboard - setup actions only in Exams tab
@@ -1197,9 +1219,7 @@ with tabs[0]:
                     button_label="Add topics",
                     on_click_key="gate_add_topics"
                 ):
-                    st.session_state.expand_topics = True
-                    st.session_state.navigate_to_exams_tab = True
-                    st.rerun()
+                    add_topics_dialog()
                 # Stop here - don't show predictions without topics
 
             # Gate 3: All prerequisites met → show full dashboard
