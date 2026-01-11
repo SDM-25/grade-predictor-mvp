@@ -859,6 +859,65 @@ target_marks = int(course_row["target_marks"]) if course_row["target_marks"] els
 st.title("Exam Readiness Predictor")
 st.caption("Auto-calculated mastery from study sessions, exercises, and lectures.")
 
+# ============ DIALOG FUNCTIONS ============
+@st.dialog("Add Exam")
+def add_exam_dialog():
+    """Dialog for adding a new exam."""
+    exam_name = st.text_input("Exam name", placeholder="e.g., Midterm, Final Exam")
+    col1, col2 = st.columns(2)
+    with col1:
+        exam_date_input = st.date_input("Exam date", value=date.today() + timedelta(days=60))
+    with col2:
+        exam_marks = st.number_input("Marks", min_value=1, value=100, help="How many marks is this exam worth?")
+    is_retake_input = st.checkbox("This is a retake (no lectures)", value=False,
+                                  help="Retake exams exclude lectures from readiness calculations")
+
+    col_cancel, col_submit = st.columns(2)
+    with col_cancel:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
+    with col_submit:
+        if st.button("Add Exam", type="primary", use_container_width=True):
+            if exam_name.strip():
+                execute_returning("INSERT INTO exams(user_id, course_id, exam_name, exam_date, marks, is_retake) VALUES(?,?,?,?,?,?)",
+                                 (user_id, course_id, exam_name.strip(), str(exam_date_input), exam_marks, 1 if is_retake_input else 0))
+                st.session_state.exam_created_msg = f"Exam '{exam_name}' created!"
+                st.rerun()
+            else:
+                st.error("Please enter an exam name.")
+
+@st.dialog("Add Assessment")
+def add_assessment_dialog():
+    """Dialog for adding a new assessment."""
+    asmt_name = st.text_input("Assessment name *", placeholder="e.g., Midterm Exam")
+    asmt_type = st.selectbox("Type", ["Exam", "Assignment", "Project", "Quiz", "Other"])
+    col1, col2 = st.columns(2)
+    with col1:
+        asmt_marks = st.number_input("Marks *", min_value=1, value=50, help="How many marks is this worth?")
+    with col2:
+        asmt_due = st.date_input("Due date (optional)", value=None)
+    asmt_timed = st.checkbox("Timed (exam-like)", value=True,
+                             help="Check for exams/quizzes, uncheck for assignments/projects")
+    asmt_notes = st.text_input("Notes (optional)")
+
+    col_cancel, col_submit = st.columns(2)
+    with col_cancel:
+        if st.button("Cancel", use_container_width=True, key="asmt_cancel"):
+            st.rerun()
+    with col_submit:
+        if st.button("Add Assessment", type="primary", use_container_width=True, key="asmt_submit"):
+            if asmt_name.strip():
+                execute_returning(
+                    """INSERT INTO assessments(user_id, course_id, assessment_name, assessment_type, marks, due_date, is_timed, notes)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (user_id, course_id, asmt_name.strip(), asmt_type, asmt_marks,
+                     str(asmt_due) if asmt_due else None, 1 if asmt_timed else 0, asmt_notes)
+                )
+                st.toast(f"Added: {asmt_name} ({asmt_marks} marks)")
+                st.rerun()
+            else:
+                st.error("Please enter an assessment name.")
+
 # ============ SETUP BAR HELPER ============
 def render_setup_bar(user_id: int, course_id: int):
     """Render a persistent setup bar with primary actions."""
@@ -870,14 +929,11 @@ def render_setup_bar(user_id: int, course_id: int):
     cols = st.columns([1, 1, 4]) if has_course_exams else st.columns([1, 5])
     with cols[0]:
         if st.button("Add exam", key=f"setup_add_exam_{st.session_state.get('_setup_bar_key', 0)}", use_container_width=True):
-            st.session_state.navigate_to_exams_tab = True
-            st.rerun()
+            add_exam_dialog()
     if has_course_exams:
         with cols[1]:
             if st.button("Add assessment", key=f"setup_add_assessment_{st.session_state.get('_setup_bar_key', 0)}", use_container_width=True):
-                st.session_state.expand_assessments = True
-                st.session_state.navigate_to_exams_tab = True
-                st.rerun()
+                add_assessment_dialog()
 
 # ============ TABS ============
 # Simplified 3-tab layout: Dashboard, Exams (setup), Study (log sessions)
@@ -900,11 +956,7 @@ with tabs[0]:
             button_label="Add exam",
             on_click_key="navigate_to_exams"
         ):
-            st.toast("Click the Exams tab above to add your first exam!")
-            st.rerun()
-
-        if st.session_state.navigate_to_exams:
-            st.info("Head to the **Exams** tab above to create your first exam.")
+            add_exam_dialog()
 
     if has_exams:
         # ============ VIEW TOGGLE (GLOBAL vs COURSE) ============
@@ -930,12 +982,9 @@ with tabs[0]:
             ]
             clicked = render_setup_checklist(setup_items)
             if clicked == 'checklist_exam':
-                st.session_state.navigate_to_exams_tab = True
-                st.rerun()
+                add_exam_dialog()
             elif clicked == 'checklist_assessment':
-                st.session_state.expand_assessments = True
-                st.session_state.navigate_to_exams_tab = True
-                st.rerun()
+                add_assessment_dialog()
             elif clicked == 'checklist_topics':
                 st.session_state.expand_topics = True
                 st.session_state.navigate_to_exams_tab = True
@@ -1124,9 +1173,7 @@ with tabs[0]:
                     button_label="Add assessment",
                     on_click_key="gate_add_assessment"
                 ):
-                    st.session_state.expand_assessments = True
-                    st.session_state.navigate_to_exams_tab = True
-                    st.rerun()
+                    add_assessment_dialog()
                 # Stop here - don't show predictions without assessments
 
             # Gate 2: Has assessments but no topics → show Setup required card
@@ -1633,21 +1680,19 @@ with tabs[1]:
     # ============ EXAMS SECTION (Main - always visible) ============
     st.write("### Add Exam")
 
-    # Show highlight if navigating from empty state or setup bar
-    if st.session_state.get("navigate_to_exams", False):
-        st.success("**Add your first exam below to start tracking your readiness!**")
-        st.session_state.navigate_to_exams = False
-    if st.session_state.pop("navigate_to_exams_tab", False):
-        st.info("**Add an exam below or expand Assessments to add assessments.**")
-
     # Show post-exam-creation success message and next step guidance
     if "exam_created_msg" in st.session_state:
         st.success(st.session_state.pop("exam_created_msg"))
         next_step = st.session_state.pop("post_exam_next_step", None)
         if next_step == "assessments":
-            st.info("**Next step:** Add an assessment below to define what you're being graded on.")
+            col_msg, col_btn = st.columns([3, 1])
+            with col_msg:
+                st.info("**Next step:** Add an assessment to define what you're being graded on.")
+            with col_btn:
+                if st.button("Add assessment", key="post_exam_add_assessment", type="primary"):
+                    add_assessment_dialog()
         elif next_step == "topics":
-            st.info("**Next step:** Add topics below to track what you need to study.")
+            st.info("**Next step:** Expand Topics below to add what you need to study.")
 
     exams_df = read_sql("SELECT * FROM exams WHERE user_id=? AND course_id=? ORDER BY exam_date",
                         (user_id, course_id))
