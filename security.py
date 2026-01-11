@@ -19,6 +19,7 @@ ALLOWED_TABLES: Set[str] = frozenset({
     "scheduled_lectures",
     "timed_attempts",
     "assessments",
+    "assignment_work",
     "study_sessions",
     "exercises",
     "users",

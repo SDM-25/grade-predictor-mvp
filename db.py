@@ -376,15 +376,14 @@ def init_db(validate: bool = True, verbose: bool = False):
     This function:
     1. Runs all pending migrations in order (with auto-repair for SQLite)
     2. Validates schema matches expected structure (prevents missing column bugs)
-    3. Auto-repairs missing columns before failing
+    3. Auto-repairs missing tables and columns
+    4. Logs issues to stderr for Streamlit Cloud visibility
+    5. Does NOT crash the app - logs warnings and continues
 
     Args:
         validate: If True (default), validate schema after migrations.
-                  Raises SchemaError if any expected table/column is missing.
+                  Issues are logged to stderr but don't crash the app.
         verbose: If True, print migration progress.
-
-    Raises:
-        SchemaError: If validate=True and schema is invalid after repair attempts.
 
     Usage:
         # Standard initialization (recommended)
@@ -396,6 +395,7 @@ def init_db(validate: bool = True, verbose: bool = False):
         # Verbose mode for debugging
         init_db(verbose=True)
     """
+    import sys
     from migrations import run_migrations, validate_schema, repair_schema, SchemaError
 
     try:
@@ -405,24 +405,38 @@ def init_db(validate: bool = True, verbose: bool = False):
         # Validate schema to catch missing columns BEFORE app runs
         # validate_schema also attempts auto-repair before failing
         if validate:
-            validate_schema(raise_on_error=True, auto_repair=True)
+            # Don't raise on error - we want to log and continue
+            issues = validate_schema(raise_on_error=False, auto_repair=True)
+
+            if issues:
+                # Log detailed issues to stderr (visible in Streamlit Cloud logs)
+                print(f"[db] WARNING: Schema validation found issues after auto-repair:", file=sys.stderr)
+                for table, cols in issues.items():
+                    if cols == ["TABLE_MISSING"]:
+                        print(f"[db]   - Missing table: {table}", file=sys.stderr)
+                    else:
+                        print(f"[db]   - Table '{table}' missing columns: {cols}", file=sys.stderr)
+                print(f"[db] The app will continue but some features may not work.", file=sys.stderr)
+                print(f"[db] Database: {get_database_url()}", file=sys.stderr)
 
         if verbose:
             print(f"[db] Initialized. Using: {get_database_url()}")
 
     except SchemaError as e:
-        # Log the full error for debugging
-        import sys
-        print(f"[db] FATAL: Schema error during init_db()", file=sys.stderr)
+        # SchemaError shouldn't be raised anymore with raise_on_error=False,
+        # but handle it gracefully just in case
+        print(f"[db] WARNING: Schema error during init_db()", file=sys.stderr)
         print(f"[db] Database: {get_database_url()}", file=sys.stderr)
         print(f"[db] Error: {e}", file=sys.stderr)
-        raise  # Re-raise the original error with its helpful message
+        print(f"[db] Continuing anyway - some features may not work.", file=sys.stderr)
+        # Don't re-raise - let the app try to run
 
     except Exception as e:
-        # Unexpected error - wrap with context
-        import sys
-        print(f"[db] FATAL: Unexpected error during init_db(): {e}", file=sys.stderr)
-        raise
+        # Unexpected error - log but don't crash
+        print(f"[db] WARNING: Unexpected error during init_db(): {e}", file=sys.stderr)
+        print(f"[db] Database: {get_database_url()}", file=sys.stderr)
+        print(f"[db] Continuing anyway - some features may not work.", file=sys.stderr)
+        # Don't re-raise - let the app try to run
 
 
 def init_db_legacy():
