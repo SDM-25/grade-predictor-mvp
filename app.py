@@ -188,9 +188,15 @@ if "navigate_to_topics" not in st.session_state:
 if "data_version" not in st.session_state:
     st.session_state.data_version = 0
 
+# Selected exam ID for Dashboard tracking - store ONLY the ID, not the full object
+# This ensures we always fetch fresh data from DB
+if "selected_exam_id" not in st.session_state:
+    st.session_state.selected_exam_id = None
+
 def invalidate_data():
     """Increment data_version to invalidate cached reads and widget states."""
     st.session_state.data_version += 1
+    print(f"[app] Data invalidated, version now: {st.session_state.data_version}", flush=True)
 
 # ============ AUTO-LOGIN WITH PERSISTENT TOKEN ============
 # Initialize cookie manager
@@ -1602,14 +1608,45 @@ with tabs[0]:
                     is_retake = not next_is_timed  # Non-timed assessments treated like retakes (no lecture requirement)
                     st.caption(f"Tracking: **{next_assessment_name}** (due {tracking_date.strftime('%d/%m/%Y')})")
                 elif not exams_df.empty:
-                    # Fallback to exam date
+                    # Fallback to exam date - use selected_exam_id from session state
+                    # Build exam ID to index mapping for selectbox
+                    exam_ids = exams_df["id"].tolist()
                     exam_options = exams_df.apply(lambda r: f"{r['exam_name']} ({r['exam_date']}){' [RETAKE]' if r.get('is_retake', 0) == 1 else ''}", axis=1).tolist()
-                    selected_exam_idx = st.selectbox("Select exam to track", range(len(exam_options)), format_func=lambda i: exam_options[i])
-                    exam_row = exams_df.iloc[selected_exam_idx]
-                    tracking_date = pd.to_datetime(exam_row["exam_date"]).date()
-                    days_left = max((tracking_date - today).days, 0)
-                    is_retake = bool(exam_row.get("is_retake", 0))
-                    next_assessment_name = exam_row["exam_name"]
+
+                    # Determine default index based on stored selected_exam_id
+                    stored_exam_id = st.session_state.selected_exam_id
+                    if stored_exam_id is not None and stored_exam_id in exam_ids:
+                        default_idx = exam_ids.index(stored_exam_id)
+                    else:
+                        default_idx = 0  # First exam if no valid selection stored
+
+                    # Selectbox with data_version in key to force refresh after edits
+                    selected_exam_idx = st.selectbox(
+                        "Select exam to track",
+                        range(len(exam_options)),
+                        index=default_idx,
+                        format_func=lambda i: exam_options[i],
+                        key=f"dashboard_exam_select_{course_id}_{st.session_state.data_version}"
+                    )
+
+                    # Store the selected exam ID (not the full object)
+                    selected_exam_id = int(exam_ids[selected_exam_idx])
+                    st.session_state.selected_exam_id = selected_exam_id
+
+                    # ALWAYS fetch fresh exam data from DB using the ID
+                    exam_row_df = read_sql("SELECT * FROM exams WHERE id=? AND user_id=?", (selected_exam_id, user_id))
+                    if not exam_row_df.empty:
+                        exam_row = exam_row_df.iloc[0]
+                        tracking_date = pd.to_datetime(exam_row["exam_date"]).date()
+                        days_left = max((tracking_date - today).days, 0)
+                        is_retake = bool(exam_row.get("is_retake", 0))
+                        next_assessment_name = exam_row["exam_name"]
+                    else:
+                        # Fallback if exam was deleted
+                        tracking_date = None
+                        days_left = 30
+                        is_retake = False
+                        next_assessment_name = "Unknown"
                 else:
                     # No due dates set — use defaults
                     tracking_date = None
@@ -2164,14 +2201,20 @@ with tabs[1]:
         col1, col2 = st.columns(2)
         with col1:
             if st.button("Save Exam Changes"):
+                updated_ids = []
                 for _, row in edited_exams.iterrows():
                     if not row["delete"]:
+                        exam_id = int(row["id"])
+                        new_date = pd.to_datetime(row["exam_date"]).strftime("%Y-%m-%d")
                         actual = int(row["actual_marks"]) if pd.notna(row["actual_marks"]) else None
                         execute(
                             "UPDATE exams SET exam_name=?, exam_date=?, marks=?, actual_marks=?, is_retake=? WHERE id=? AND user_id=?",
-                            (row["exam_name"], pd.to_datetime(row["exam_date"]).strftime("%Y-%m-%d"),
-                             int(row["marks"]), actual, 1 if row["is_retake"] else 0, int(row["id"]), user_id)
+                            (row["exam_name"], new_date,
+                             int(row["marks"]), actual, 1 if row["is_retake"] else 0, exam_id, user_id)
                         )
+                        updated_ids.append(exam_id)
+                        print(f"[app] Updated exam id={exam_id}, new_date={new_date}", flush=True)
+                print(f"[app] Save Exam Changes: updated {len(updated_ids)} exam(s): {updated_ids}", flush=True)
                 st.success("Exams updated!")
                 invalidate_data()  # Force refresh of all cached data
                 st.rerun()
