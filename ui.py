@@ -510,6 +510,181 @@ p, .stMarkdown {
     margin-top: 2rem;
 }
 
+/* Quick Navigation Bar - Compact jump links */
+.quick-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    padding: 0.6rem 0;
+    margin: 0.75rem 0 1.25rem 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.quick-nav-label {
+    display: flex;
+    align-items: center;
+    font-size: 0.7rem;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.4);
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    margin-right: 0.25rem;
+}
+.quick-nav-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.35rem 0.7rem;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 5px;
+    color: rgba(255, 255, 255, 0.65);
+    font-size: 0.75rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    text-decoration: none;
+}
+.quick-nav-btn:hover {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.15);
+    color: rgba(255, 255, 255, 0.9);
+    transform: translateY(-1px);
+}
+.quick-nav-btn:active {
+    transform: translateY(0);
+}
+.quick-nav-btn-icon {
+    font-size: 0.8rem;
+    opacity: 0.8;
+}
+
+/* Dashboard Section Card - Enhanced visual separation */
+.dashboard-section {
+    background: rgba(255, 255, 255, 0.015);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    padding: 1.1rem 1.25rem;
+    margin-bottom: 1.75rem;
+    transition: border-color 0.2s ease;
+}
+.dashboard-section:hover {
+    border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* Primary Section - For Recommended Actions (emphasized) */
+.dashboard-section-primary {
+    background: linear-gradient(135deg, rgba(59, 130, 246, 0.06) 0%, rgba(59, 130, 246, 0.02) 100%);
+    border: 1px solid rgba(59, 130, 246, 0.2);
+    border-radius: 10px;
+    padding: 1.1rem 1.25rem;
+    margin-bottom: 1.75rem;
+    box-shadow: 0 2px 8px rgba(59, 130, 246, 0.05);
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.dashboard-section-primary:hover {
+    border-color: rgba(59, 130, 246, 0.3);
+    box-shadow: 0 4px 12px rgba(59, 130, 246, 0.08);
+}
+
+/* Section Header inside cards */
+.section-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.9);
+    margin-bottom: 0.9rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.section-title-primary {
+    font-size: 1rem;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.95);
+    margin-bottom: 0.9rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid rgba(59, 130, 246, 0.15);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.section-title-icon {
+    font-size: 1rem;
+    opacity: 0.85;
+}
+
+/* Collapsible section styling */
+.collapsible-section {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    margin-bottom: 1rem;
+}
+
+/* Sidebar improvements - Clear visual grouping */
+.sidebar-section {
+    padding: 0.75rem 0;
+}
+.sidebar-section-header {
+    font-size: 0.65rem;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.45);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    margin-bottom: 0.6rem;
+    padding-left: 2px;
+}
+.sidebar-divider {
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    margin: 1rem 0;
+}
+/* Sidebar course selection group */
+.sidebar-course-group {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    padding: 0.75rem;
+    margin-bottom: 0.75rem;
+}
+/* Sidebar add course group - visually distinct */
+.sidebar-add-group {
+    background: rgba(255, 255, 255, 0.01);
+    border: 1px dashed rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 0.75rem;
+    margin-top: 0.5rem;
+}
+.sidebar-add-group:hover {
+    border-color: rgba(255, 255, 255, 0.15);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+@media (max-width: 768px) {
+    .quick-nav {
+        gap: 0.4rem;
+        padding: 0.5rem 0;
+    }
+    .quick-nav-btn {
+        padding: 0.35rem 0.65rem;
+        font-size: 0.75rem;
+    }
+    .dashboard-section, .dashboard-section-primary {
+        padding: 1rem;
+        margin-bottom: 1rem;
+    }
+}
+@media (max-width: 480px) {
+    .quick-nav-btn {
+        padding: 0.3rem 0.5rem;
+        font-size: 0.7rem;
+    }
+    .dashboard-section, .dashboard-section-primary {
+        padding: 0.85rem;
+        border-radius: 8px;
+    }
+}
+
 /* Confidence indicator */
 .confidence-indicator {
     font-size: 0.8rem;
@@ -778,4 +953,52 @@ def card_start(title: str = None):
 
 def card_end():
     """End a card container started with card_start()."""
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_quick_nav(sections: list):
+    """
+    Render a compact quick navigation bar with jump links to dashboard sections.
+
+    Args:
+        sections: List of dicts with keys: id, label, icon (optional)
+    """
+    buttons_html = '<span class="quick-nav-label">Jump to:</span>'
+    for section in sections:
+        icon_html = f'<span class="quick-nav-btn-icon">{section.get("icon", "")}</span>' if section.get("icon") else ""
+        buttons_html += f'''
+        <a href="#{section['id']}" class="quick-nav-btn">
+            {icon_html}{section['label']}
+        </a>
+        '''
+
+    st.markdown(f'''
+    <div class="quick-nav">
+        {buttons_html}
+    </div>
+    ''', unsafe_allow_html=True)
+
+
+def dashboard_section_start(section_id: str, title: str, icon: str = None, primary: bool = False):
+    """
+    Start an enhanced dashboard section card with anchor.
+
+    Args:
+        section_id: HTML anchor ID for navigation
+        title: Section title
+        icon: Optional emoji icon
+        primary: If True, uses emphasized primary styling
+    """
+    css_class = "dashboard-section-primary" if primary else "dashboard-section"
+    title_class = "section-title-primary" if primary else "section-title"
+    icon_html = f'<span class="section-title-icon">{icon}</span>' if icon else ""
+
+    st.markdown(f'''
+    <div id="{section_id}" class="{css_class}">
+        <div class="{title_class}">{icon_html}{title}</div>
+    ''', unsafe_allow_html=True)
+
+
+def dashboard_section_end():
+    """End a dashboard section started with dashboard_section_start()."""
     st.markdown('</div>', unsafe_allow_html=True)
