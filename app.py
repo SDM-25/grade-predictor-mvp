@@ -1323,35 +1323,197 @@ def render_topics_manager(user_id: int, course_id: int, show_import: bool = True
                     st.rerun()
 
 
+# ============ DASHBOARD SETUP WIZARD ============
+def render_dashboard_setup_wizard(user_id: int, course_id: int, course_name: str):
+    """
+    Render a prominent setup wizard on the Dashboard when setup is incomplete.
+    Returns True if setup is complete, False otherwise.
+
+    Steps:
+    1. Add exam (if no exam for current course)
+    2. Add assessment (if no assessment for current course)
+    3. Add topics (if no topics for current course)
+    """
+    # Check setup status
+    exam_count = read_sql("SELECT COUNT(*) as cnt FROM exams WHERE user_id=? AND course_id=?", (user_id, course_id))
+    assessment_count = read_sql("SELECT COUNT(*) as cnt FROM assessments WHERE user_id=? AND course_id=?", (user_id, course_id))
+    topic_count = read_sql("SELECT COUNT(*) as cnt FROM topics WHERE user_id=? AND course_id=?", (user_id, course_id))
+
+    has_exams = exam_count.iloc[0]['cnt'] > 0 if not exam_count.empty else False
+    has_assessments = assessment_count.iloc[0]['cnt'] > 0 if not assessment_count.empty else False
+    has_topics = topic_count.iloc[0]['cnt'] > 0 if not topic_count.empty else False
+
+    # If all setup is complete, return True
+    if has_exams and has_assessments and has_topics:
+        return True
+
+    # Calculate current step
+    if not has_exams:
+        current_step = 1
+    elif not has_assessments:
+        current_step = 2
+    else:
+        current_step = 3
+
+    # Wizard header
+    st.markdown("""
+    <div style="
+        background: linear-gradient(135deg, rgba(59, 130, 246, 0.1) 0%, rgba(59, 130, 246, 0.05) 100%);
+        border: 1px solid rgba(59, 130, 246, 0.3);
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 1.5rem;
+    ">
+        <div style="font-size: 1.1rem; font-weight: 600; color: rgba(255, 255, 255, 0.95); margin-bottom: 0.5rem;">
+            Complete Setup for {course_name}
+        </div>
+        <div style="font-size: 0.9rem; color: rgba(255, 255, 255, 0.6); margin-bottom: 1rem;">
+            Follow these steps to unlock your personalized dashboard and study recommendations.
+        </div>
+    </div>
+    """.replace("{course_name}", course_name), unsafe_allow_html=True)
+
+    # Step indicators
+    steps = [
+        ("1", "Add Exam", "Set your exam date", has_exams),
+        ("2", "Add Assessment", "Define grading components", has_assessments),
+        ("3", "Add Topics", "List what you need to study", has_topics),
+    ]
+
+    cols = st.columns(3)
+    for i, (num, title, desc, done) in enumerate(steps):
+        with cols[i]:
+            if done:
+                # Completed step
+                st.markdown(f"""
+                <div style="
+                    background: rgba(34, 197, 94, 0.1);
+                    border: 1px solid rgba(34, 197, 94, 0.3);
+                    border-radius: 8px;
+                    padding: 0.75rem;
+                    text-align: center;
+                ">
+                    <div style="font-size: 1.2rem; color: #22c55e;">&#10003;</div>
+                    <div style="font-size: 0.85rem; font-weight: 500; color: rgba(34, 197, 94, 0.9);">{title}</div>
+                    <div style="font-size: 0.7rem; color: rgba(255, 255, 255, 0.4);">Complete</div>
+                </div>
+                """, unsafe_allow_html=True)
+            elif i + 1 == current_step:
+                # Current step
+                st.markdown(f"""
+                <div style="
+                    background: rgba(59, 130, 246, 0.15);
+                    border: 2px solid rgba(59, 130, 246, 0.5);
+                    border-radius: 8px;
+                    padding: 0.75rem;
+                    text-align: center;
+                ">
+                    <div style="font-size: 1.2rem; font-weight: 600; color: #3b82f6;">{num}</div>
+                    <div style="font-size: 0.85rem; font-weight: 600; color: rgba(255, 255, 255, 0.95);">{title}</div>
+                    <div style="font-size: 0.7rem; color: rgba(255, 255, 255, 0.5);">{desc}</div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                # Future step
+                st.markdown(f"""
+                <div style="
+                    background: rgba(255, 255, 255, 0.02);
+                    border: 1px solid rgba(255, 255, 255, 0.1);
+                    border-radius: 8px;
+                    padding: 0.75rem;
+                    text-align: center;
+                    opacity: 0.5;
+                ">
+                    <div style="font-size: 1.2rem; font-weight: 500; color: rgba(255, 255, 255, 0.4);">{num}</div>
+                    <div style="font-size: 0.85rem; font-weight: 500; color: rgba(255, 255, 255, 0.4);">{title}</div>
+                    <div style="font-size: 0.7rem; color: rgba(255, 255, 255, 0.3);">{desc}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # Current step action
+    if current_step == 1:
+        st.markdown("### Step 1: Add Your Exam")
+        st.markdown("Set when your exam is scheduled. This helps us calculate your readiness and prioritize what to study.")
+
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            if st.button("Add Exam", type="primary", use_container_width=True, key="wizard_add_exam"):
+                add_exam_dialog()
+
+    elif current_step == 2:
+        st.markdown("### Step 2: Add Assessment Details")
+        st.markdown("Define what you're being graded on (exams, assignments, projects). This helps calculate your predicted grade.")
+
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            if st.button("Add Assessment", type="primary", use_container_width=True, key="wizard_add_assessment"):
+                add_assessment_dialog()
+
+    elif current_step == 3:
+        st.markdown("### Step 3: Add Your Topics")
+        st.markdown("List the topics you need to study. You can add them one by one or import from PDF lecture slides.")
+
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.caption("Go to the **Topics** tab to add topics manually or import from PDFs.")
+        with col2:
+            if st.button("Go to Topics", type="primary", use_container_width=True, key="wizard_goto_topics"):
+                st.toast("Click the **Topics** tab above to add your topics")
+
+    # Preview of what they'll get
+    st.markdown("")
+    st.divider()
+    st.markdown("""
+    <div style="text-align: center; padding: 1rem 0;">
+        <div style="font-size: 0.9rem; color: rgba(255, 255, 255, 0.5); margin-bottom: 0.5rem;">
+            Once setup is complete, you'll unlock:
+        </div>
+        <div style="display: flex; justify-content: center; gap: 2rem; flex-wrap: wrap;">
+            <div style="text-align: center;">
+                <div style="font-size: 1.5rem;">&#128202;</div>
+                <div style="font-size: 0.8rem; color: rgba(255, 255, 255, 0.6);">Grade Predictions</div>
+            </div>
+            <div style="text-align: center;">
+                <div style="font-size: 1.5rem;">&#127919;</div>
+                <div style="font-size: 0.8rem; color: rgba(255, 255, 255, 0.6);">Smart Recommendations</div>
+            </div>
+            <div style="text-align: center;">
+                <div style="font-size: 1.5rem;">&#128197;</div>
+                <div style="font-size: 0.8rem; color: rgba(255, 255, 255, 0.6);">7-Day Study Plan</div>
+            </div>
+            <div style="text-align: center;">
+                <div style="font-size: 1.5rem;">&#128200;</div>
+                <div style="font-size: 0.8rem; color: rgba(255, 255, 255, 0.6);">Progress Tracking</div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    return False
+
+
 # ============ TABS ============
-# 4-tab layout: Dashboard, Exams (setup), Topics (management), Study (log sessions)
-tabs = st.tabs(["Dashboard", "Exams", "Topics", "Study"])
+# 4-tab layout: Dashboard, Setup (was Exams), Topics (management), Study (log sessions)
+tabs = st.tabs(["Dashboard", "Setup", "Topics", "Study"])
 
 # ============ DASHBOARD ============
 with tabs[0]:
     today = date.today()
+    st.header("Dashboard")
 
-    # ============ EMPTY STATE CHECK ============
-    total_exams_df = read_sql("SELECT COUNT(*) as cnt FROM exams WHERE user_id=?", (user_id,))
-    has_exams = total_exams_df.iloc[0]['cnt'] > 0 if not total_exams_df.empty else False
+    # ============ SETUP WIZARD (gates analytics until complete) ============
+    # Check setup completion for current course using new wizard
+    setup_complete = render_dashboard_setup_wizard(user_id, course_id, selected_course)
 
-    if not has_exams:
-        # ============ EMPTY STATE UI ============
-        st.markdown("")
-        if render_empty_state(
-            title="No exams yet",
-            description="Add your first exam to start tracking your readiness and get personalized study recommendations.",
-            button_label="Add exam",
-            on_click_key="navigate_to_exams"
-        ):
-            add_exam_dialog()
-
-    if has_exams:
-        # ============ VIEW TOGGLE (GLOBAL vs COURSE) ============
-        st.header("Dashboard")
-
-        # ============ ONBOARDING CHECKLIST ============
-        # Check setup completion for current course
+    # Gate analytics behind setup completion
+    if not setup_complete:
+        # Wizard already rendered above - stop here
+        pass
+    else:
+        # ============ SETUP COMPLETE - SHOW FULL ANALYTICS ============
+        # Re-check counts for internal use (wizard already checked these)
         course_exam_count = read_sql("SELECT COUNT(*) as cnt FROM exams WHERE user_id=? AND course_id=?", (user_id, course_id))
         course_assessment_count = read_sql("SELECT COUNT(*) as cnt FROM assessments WHERE user_id=? AND course_id=?", (user_id, course_id))
         course_topic_count = read_sql("SELECT COUNT(*) as cnt FROM topics WHERE user_id=? AND course_id=?", (user_id, course_id))
@@ -1360,46 +1522,15 @@ with tabs[0]:
         has_course_assessments = course_assessment_count.iloc[0]['cnt'] > 0 if not course_assessment_count.empty else False
         has_course_topics = course_topic_count.iloc[0]['cnt'] > 0 if not course_topic_count.empty else False
 
-        setup_incomplete = not (has_course_exams and has_course_assessments and has_course_topics)
+        # Setup complete - show compact status with manage topics shortcut
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.success("Setup complete")
+        with col2:
+            if st.button("Manage topics", key="dashboard_manage_topics", use_container_width=True):
+                st.toast("Click the **Topics** tab above to manage your topics")
 
-        if setup_incomplete:
-            # Inline setup checklist with direct dialog calls
-            st.markdown("**Complete Setup**")
-            setup_items = [
-                ('Add exam', has_course_exams, 'checklist_exam'),
-                ('Add assessment', has_course_assessments, 'checklist_assessment'),
-                ('Add topics', has_course_topics, 'checklist_topics'),
-            ]
-            for label, done, key in setup_items:
-                col1, col2 = st.columns([4, 1])
-                with col1:
-                    if done:
-                        st.markdown(f":white_check_mark: ~~{label}~~")
-                    else:
-                        st.markdown(f":white_circle: {label}")
-                with col2:
-                    if not done:
-                        if key == 'checklist_exam':
-                            if st.button("Add", key=key, use_container_width=True):
-                                add_exam_dialog()
-                        elif key == 'checklist_assessment':
-                            if st.button("Add", key=key, use_container_width=True):
-                                add_assessment_dialog()
-                        elif key == 'checklist_topics':
-                            # Navigate to Topics tab
-                            if st.button("Add", key=key, use_container_width=True):
-                                st.toast("Click the **Topics** tab above to add topics")
-            st.markdown("")
-        else:
-            # Setup complete - show compact status with manage topics shortcut
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.success("Setup complete")
-            with col2:
-                if st.button("Manage topics", key="dashboard_manage_topics", use_container_width=True):
-                    st.toast("Click the **Topics** tab above to manage your topics")
-
-        # NOTE: Setup bar removed from Dashboard - setup actions only in Exams tab
+        # NOTE: Setup bar removed from Dashboard - setup actions only in Setup tab
 
         view_col1, view_col2 = st.columns([2, 1])
         with view_col1:
@@ -2104,10 +2235,10 @@ with tabs[0]:
                         }
                     )
 
-# ============ EXAMS TAB (Setup) ============
-# Contains: Exams (main), Assessments, Topics, Import Topics
+# ============ SETUP TAB ============
+# Contains: Exams (main), Assessments, Topics link
 with tabs[1]:
-    st.header("Exam Setup")
+    st.header("Setup")
 
     # Setup bar for quick actions
     st.session_state._setup_bar_key = 1
@@ -2516,6 +2647,27 @@ with tabs[3]:
                         st.success(f"Deleted {len(to_delete)} session(s)!")
                         invalidate_data()
                         st.rerun()
+            else:
+                # Empty state with CTA
+                st.markdown("""
+                <div style="
+                    background: rgba(34, 197, 94, 0.08);
+                    border: 1px solid rgba(34, 197, 94, 0.2);
+                    border-radius: 10px;
+                    padding: 1.5rem;
+                    text-align: center;
+                    margin: 1rem 0;
+                ">
+                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">&#128218;</div>
+                    <div style="font-size: 1rem; font-weight: 600; color: rgba(255, 255, 255, 0.9); margin-bottom: 0.25rem;">
+                        No study sessions yet
+                    </div>
+                    <div style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.6); margin-bottom: 0.75rem;">
+                        Log your study sessions to track mastery and get better predictions.
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                st.caption("Use the form above to log your first study session.")
 
     # ============ EXERCISES EXPANDER ============
     with st.expander("Exercises", expanded=False):
@@ -2582,6 +2734,27 @@ with tabs[3]:
                         st.success(f"Deleted {len(to_delete)} exercise(s)!")
                         invalidate_data()
                         st.rerun()
+            else:
+                # Empty state with CTA
+                st.markdown("""
+                <div style="
+                    background: rgba(168, 85, 247, 0.08);
+                    border: 1px solid rgba(168, 85, 247, 0.2);
+                    border-radius: 10px;
+                    padding: 1.5rem;
+                    text-align: center;
+                    margin: 1rem 0;
+                ">
+                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">&#9999;&#65039;</div>
+                    <div style="font-size: 1rem; font-weight: 600; color: rgba(255, 255, 255, 0.9); margin-bottom: 0.25rem;">
+                        No exercises logged yet
+                    </div>
+                    <div style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.6); margin-bottom: 0.75rem;">
+                        Practice questions help build mastery. Log your exercises to track progress.
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                st.caption("Use the form above to log your first exercise session.")
 
     # ============ TIMED ATTEMPTS EXPANDER ============
     with st.expander("Timed Attempts", expanded=False):
@@ -2683,7 +2856,26 @@ with tabs[3]:
                 recent_count = len(timed_df[pd.to_datetime(timed_df["attempt_date"]).dt.date >= (date.today() - timedelta(days=14))])
                 st.metric("Last 14 Days", f"{recent_count} attempts")
         else:
-            st.info("No timed attempts logged yet. Log your first practice exam above!")
+            # Empty state with prominent CTA
+            st.markdown("""
+            <div style="
+                background: rgba(59, 130, 246, 0.08);
+                border: 1px solid rgba(59, 130, 246, 0.2);
+                border-radius: 10px;
+                padding: 1.5rem;
+                text-align: center;
+                margin: 1rem 0;
+            ">
+                <div style="font-size: 2rem; margin-bottom: 0.5rem;">&#128221;</div>
+                <div style="font-size: 1rem; font-weight: 600; color: rgba(255, 255, 255, 0.9); margin-bottom: 0.25rem;">
+                    No timed attempts yet
+                </div>
+                <div style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.6); margin-bottom: 0.75rem;">
+                    Practice with past papers to improve your predictions and track progress.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.caption("Use the form above to log your first timed attempt.")
 
     # ============ LECTURE CALENDAR EXPANDER ============
     with st.expander("Lecture Calendar", expanded=False):
