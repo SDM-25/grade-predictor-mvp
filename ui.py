@@ -1,6 +1,7 @@
 """
 UI Components and Styling for Exam Readiness Predictor
 Modern SaaS-style dashboard components
+v2.1 - Added quick navigation and dashboard sections
 """
 import streamlit as st
 
